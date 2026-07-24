@@ -475,7 +475,7 @@ async def rank(interaction: discord.Interaction, member: discord.Member | None =
         ),
         inline=False,
     )
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="leaderboard", description="Show the top voice-level members.")
@@ -493,9 +493,12 @@ async def leaderboard(interaction: discord.Interaction) -> None:
         interaction.guild.id,
     )
 
-    if not rows:
-        await interaction.response.send_message("No voice activity has been recorded yet.")
-        return
+ if not rows:
+    await interaction.response.send_message(
+        "No voice activity has been recorded yet.",
+        ephemeral=True,
+    )
+    return
 
     medals = ["🥇", "🥈", "🥉"]
     lines: list[str] = []
@@ -513,7 +516,7 @@ async def leaderboard(interaction: discord.Interaction) -> None:
         description="\n".join(lines),
         color=discord.Color.gold(),
     )
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="syncnickname", description="Reapply your current superscript level nickname.")
