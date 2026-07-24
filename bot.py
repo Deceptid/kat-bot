@@ -46,17 +46,18 @@ SYNC_NICKNAMES_ON_START = env_flag("SYNC_NICKNAMES_ON_START", default=True)
 # Custom Discord emoji codes are intentionally not supported in nicknames.
 DEFAULT_EMOJI_UNLOCKS = (
     # Levels 0, 1, and 2 unlock immediately. Every badge after that unlocks
-    # every 5 levels, moving from starter symbols and colors into hearts,
-    # gems, nature, technology, power, cosmic, and leader-tier badges.
-    "0=○,1=●,2=⚪,5=❌,10=❓,15=⚠️,20=❗,25=✅,30=➤,35=➜,"
-    "40=◇,45=◆,50=⚫,55=🟤,60=🔴,65=🟠,70=🟡,75=🟢,80=🔵,85=🟣,"
-    "90=🤍,95=🤎,100=🖤,105=❤️,110=🧡,115=💛,120=💚,125=💙,"
-    "130=💜,135=💖,140=🔹,145=🔸,150=🔷,155=🔶,160=♢,165=♦️,"
-    "170=💠,175=💎,180=🌱,185=🌿,190=🍀,195=🌸,200=🌹,205=🦋,"
-    "210=🦊,215=🐺,220=🐉,225=🔧,230=⚙️,235=🛠️,240=💻,245=📡,"
-    "250=🛰️,255=🧠,260=🤖,265=✨,270=🔥,275=⚡,280=💥,285=🌀,"
-    "290=🌙,295=☄️,300=🌌,305=⭐,310=🌟,315=💫,320=🛡️,325=🦅,"
-    "330=🦁,335=🔱,340=⚜️,345=🏆,350=👑"
+    # every 5 levels. The categories are mixed so the progression feels less
+    # repetitive while stronger power, cosmic, and leader badges remain high-tier.
+    # Gear and hammer badges are excluded; target and medal replace those slots.
+    "0=○,1=●,2=⚪,5=❓,10=➤,15=🔹,20=❌,25=🟤,30=➜,35=⚠️,"
+    "40=🔸,45=⚫,50=🔴,55=❗,60=🌱,65=🟠,70=◇,75=🌿,80=🟡,85=◆,"
+    "90=🍀,95=🟢,100=🤍,105=🌸,110=🔵,115=🤎,120=🦋,125=🟣,"
+    "130=✅,135=💛,140=🔷,145=🦊,150=💚,155=🔶,160=🐺,165=💙,"
+    "170=♢,175=🌹,180=💜,185=♦️,190=🖤,195=💠,200=❤️,205=💻,"
+    "210=🧡,215=📡,220=💖,225=🛰️,230=🔧,235=🎯,240=🧠,245=🤖,"
+    "250=💎,255=✨,260=🔥,265=⚡,270=🌀,275=💥,280=🌙,285=⭐,"
+    "290=☄️,295=🌟,300=💫,305=🌌,310=🛡️,315=🐉,320=🦅,325=🦁,"
+    "330=🔱,335=🏅,340=⚜️,345=🏆,350=👑"
 )
 
 
@@ -568,10 +569,10 @@ class VoiceLevelBot(commands.Bot):
                         migration_key,
                     )
 
-        # One-time migration to the complete 0-350 Unicode progression. This
-        # updates servers that were already using an older default schedule while
-        # preserving every member's voice time and level.
-        progression_migration_key = "full_unicode_progression_v1"
+        # One-time migration to the mixed 0-350 Unicode progression. This
+        # removes the gear and hammer badges, rearranges the unlock order, and
+        # preserves every member's voice time and level.
+        progression_migration_key = "mixed_unicode_progression_v2"
         progression_migrated = await self.pool.fetchval(
             "SELECT 1 FROM bot_migrations "
             "WHERE guild_id = $1 AND migration_key = $2;",
