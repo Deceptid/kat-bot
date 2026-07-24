@@ -493,12 +493,12 @@ async def leaderboard(interaction: discord.Interaction) -> None:
         interaction.guild.id,
     )
 
- if not rows:
-    await interaction.response.send_message(
-        "No voice activity has been recorded yet.",
-        ephemeral=True,
-    )
-    return
+    if not rows:
+        await interaction.response.send_message(
+            "No voice activity has been recorded yet.",
+            ephemeral=True,
+        )
+        return
 
     medals = ["🥇", "🥈", "🥉"]
     lines: list[str] = []
