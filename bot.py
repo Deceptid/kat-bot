@@ -782,14 +782,37 @@ class VoiceLevelBot(commands.Bot):
             return
         await self.pool.executemany(ENSURE_MEMBER_SQL, pairs)
 
-    async def apply_bot_nickname(self, guild: discord.Guild) -> str:
-        """Give this bot the nickname format 🤖│BotName in a server."""
-        member = guild.me
-        if member is None:
+    async def apply_bot_member_nickname(self, member: discord.Member) -> str:
+        """Give any editable bot the nickname format 🤖│BotName."""
+        if not member.bot:
+            return "not_bot"
+
+        guild = member.guild
+        me = guild.me
+        if me is None:
             return "missing_member"
 
-        base_name = clean_base_name(member.nick or member.global_name or member.name)
-        max_name_length = max(1, NICKNAME_MAX_LENGTH - len(BOT_NICKNAME_PREFIX))
+        # This bot may edit its own nickname. Other bots can only be renamed when
+        # this bot has Manage Nicknames and its highest role is above theirs.
+        if member.id == me.id:
+            if not (
+                me.guild_permissions.change_nickname
+                or me.guild_permissions.manage_nicknames
+            ):
+                return "missing_change_nickname"
+        else:
+            if not me.guild_permissions.manage_nicknames:
+                return "missing_manage_nicknames"
+            if member.top_role >= me.top_role:
+                return "role_hierarchy"
+
+        base_name = clean_base_name(
+            member.nick or member.global_name or member.name
+        )
+        max_name_length = max(
+            1,
+            NICKNAME_MAX_LENGTH - len(BOT_NICKNAME_PREFIX),
+        )
         desired = f"{BOT_NICKNAME_PREFIX}{base_name[:max_name_length].rstrip()}"
         if member.nick == desired:
             return "unchanged"
@@ -797,16 +820,59 @@ class VoiceLevelBot(commands.Bot):
         key = (guild.id, member.id)
         self._nickname_edits.add(key)
         try:
-            await member.edit(nick=desired, reason="Apply the bot robot nickname prefix")
+            await member.edit(
+                nick=desired,
+                reason="Apply the robot nickname prefix to a bot account",
+            )
+            # Avoid nickname rate-limit bursts when several bots are synced.
+            await asyncio.sleep(0.25)
             return "updated"
         except discord.Forbidden:
-            log.warning("Cannot update the bot nickname in guild %s", guild.id)
+            log.warning(
+                "Cannot update bot nickname for %s in guild %s due to permissions or role hierarchy",
+                member.id,
+                guild.id,
+            )
             return "forbidden"
         except discord.HTTPException:
-            log.exception("Discord rejected the bot nickname in guild %s", guild.id)
+            log.exception(
+                "Discord rejected bot nickname update for %s in guild %s",
+                member.id,
+                guild.id,
+            )
             return "http_error"
         finally:
             self._nickname_edits.discard(key)
+
+    async def apply_bot_nickname(self, guild: discord.Guild) -> str:
+        """Compatibility helper that formats this bot's own nickname."""
+        member = guild.me
+        if member is None:
+            return "missing_member"
+        return await self.apply_bot_member_nickname(member)
+
+    async def sync_guild_bot_nicknames(
+        self,
+        guild: discord.Guild,
+    ) -> tuple[int, int, int]:
+        """Apply 🤖│ to every editable bot account in the server."""
+        updated = 0
+        unchanged = 0
+        skipped = 0
+
+        for member in guild.members:
+            if not member.bot:
+                continue
+
+            result = await self.apply_bot_member_nickname(member)
+            if result == "updated":
+                updated += 1
+            elif result == "unchanged":
+                unchanged += 1
+            else:
+                skipped += 1
+
+        return updated, unchanged, skipped
 
     async def apply_level_nickname(
         self,
@@ -908,7 +974,7 @@ class VoiceLevelBot(commands.Bot):
         self,
         guild: discord.Guild,
     ) -> tuple[int, int, int]:
-        """Create missing rows and format every editable non-bot member."""
+        """Format every editable human and bot account in the server."""
         await self.ensure_guild_rows(guild)
         rows = await self.pool.fetch(
             """
@@ -929,6 +995,13 @@ class VoiceLevelBot(commands.Bot):
 
         for member in guild.members:
             if member.bot:
+                result = await self.apply_bot_member_nickname(member)
+                if result == "updated":
+                    updated += 1
+                elif result == "unchanged":
+                    unchanged += 1
+                else:
+                    skipped += 1
                 continue
 
             total_seconds, selected_emoji = stats.get(member.id, (0, ""))
@@ -1131,7 +1204,17 @@ async def on_ready() -> None:
     )
 
     for guild in bot.guilds:
-        await bot.apply_bot_nickname(guild)
+        try:
+            updated, unchanged, skipped = await bot.sync_guild_bot_nicknames(guild)
+            log.info(
+                "Bot nickname sync for %s: %s updated, %s unchanged, %s skipped",
+                guild.id,
+                updated,
+                unchanged,
+                skipped,
+            )
+        except Exception:
+            log.exception("Bot nickname sync failed for guild %s", guild.id)
 
     if SYNC_NICKNAMES_ON_START and not bot._startup_sync_started:
         bot._startup_sync_started = True
@@ -1140,7 +1223,10 @@ async def on_ready() -> None:
 
 @bot.event
 async def on_guild_join(guild: discord.Guild) -> None:
-    await bot.apply_bot_nickname(guild)
+    try:
+        await bot.sync_guild_bot_nicknames(guild)
+    except Exception:
+        log.exception("Initial bot nickname sync failed for guild %s", guild.id)
     if SYNC_NICKNAMES_ON_START:
         try:
             await bot.sync_guild_nicknames(guild)
@@ -1151,6 +1237,7 @@ async def on_guild_join(guild: discord.Guild) -> None:
 @bot.event
 async def on_member_join(member: discord.Member) -> None:
     if member.bot:
+        await bot.apply_bot_member_nickname(member)
         return
 
     row = await bot.get_or_create_stats(member.guild.id, member.id)
@@ -1169,11 +1256,12 @@ async def on_member_update(
     before: discord.Member,
     after: discord.Member,
 ) -> None:
-    if bot.user is not None and after.id == bot.user.id:
-        if (after.guild.id, after.id) not in bot._nickname_edits:
-            await bot.apply_bot_nickname(after.guild)
-        return
     if after.bot:
+        if before.nick == after.nick:
+            return
+        if (after.guild.id, after.id) in bot._nickname_edits:
+            return
+        await bot.apply_bot_member_nickname(after)
         return
     if before.nick == after.nick:
         return
@@ -1405,7 +1493,7 @@ async def sync_nickname(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(
     name="syncallnicknames",
-    description="Apply │name and superscript levels to every editable member.",
+    description="Apply nickname formatting to every editable member and bot.",
 )
 @app_commands.guild_only()
 @app_commands.checks.has_permissions(manage_guild=True)
@@ -1420,8 +1508,8 @@ async def sync_all_nicknames(interaction: discord.Interaction) -> None:
     await interaction.followup.send(
         f"Updated **{updated}** member(s), already correct: **{unchanged}**, "
         f"skipped: **{skipped}**.\n"
-        "Skipped members are normally the server owner or members whose role "
-        "is above the bot's role.",
+        "Skipped accounts are normally the server owner, bots or members whose "
+        "highest role is equal to or above this bot's role.",
         ephemeral=True,
     )
 
