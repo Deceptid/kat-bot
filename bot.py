@@ -45,10 +45,18 @@ SYNC_NICKNAMES_ON_START = env_flag("SYNC_NICKNAMES_ON_START", default=True)
 # Default Unicode badge entries. These seed each server's database.
 # Custom Discord emoji codes are intentionally not supported in nicknames.
 DEFAULT_EMOJI_UNLOCKS = (
-    # Levels 0, 1, and 2 unlock immediately, then badges unlock every 5 levels.
-    "0=⚪,1=🟣,2=🔴,5=🟢,10=🟤,15=⚫,20=🔵,25=🟡,30=🟠,"
-    "35=⭐,40=💎,45=⚡,50=🌙,55=🪐,60=👑,65=🌟,70=🏆,"
-    "75=🐉,80=💠,85=🦅,90=☄️,95=🔱,100=🌌"
+    # Levels 0, 1, and 2 unlock immediately. Every badge after that unlocks
+    # every 5 levels, moving from starter symbols and colors into hearts,
+    # gems, nature, technology, power, cosmic, and leader-tier badges.
+    "0=○,1=●,2=⚪,5=❌,10=❓,15=⚠️,20=❗,25=✅,30=➤,35=➜,"
+    "40=◇,45=◆,50=⚫,55=🟤,60=🔴,65=🟠,70=🟡,75=🟢,80=🔵,85=🟣,"
+    "90=🤍,95=🤎,100=🖤,105=❤️,110=🧡,115=💛,120=💚,125=💙,"
+    "130=💜,135=💖,140=🔹,145=🔸,150=🔷,155=🔶,160=♢,165=♦️,"
+    "170=💠,175=💎,180=🌱,185=🌿,190=🍀,195=🌸,200=🌹,205=🦋,"
+    "210=🦊,215=🐺,220=🐉,225=🔧,230=⚙️,235=🛠️,240=💻,245=📡,"
+    "250=🛰️,255=🧠,260=🤖,265=✨,270=🔥,275=⚡,280=💥,285=🌀,"
+    "290=🌙,295=☄️,300=🌌,305=⭐,310=🌟,315=💫,320=🛡️,325=🦅,"
+    "330=🦁,335=🔱,340=⚜️,345=🏆,350=👑"
 )
 
 
@@ -558,6 +566,58 @@ class VoiceLevelBot(commands.Bot):
                         """,
                         guild_id,
                         migration_key,
+                    )
+
+        # One-time migration to the complete 0-350 Unicode progression. This
+        # updates servers that were already using an older default schedule while
+        # preserving every member's voice time and level.
+        progression_migration_key = "full_unicode_progression_v1"
+        progression_migrated = await self.pool.fetchval(
+            "SELECT 1 FROM bot_migrations "
+            "WHERE guild_id = $1 AND migration_key = $2;",
+            guild_id,
+            progression_migration_key,
+        )
+        if not progression_migrated:
+            default_emojis = [emoji for _, emoji in DEFAULT_PARSED_EMOJI_UNLOCKS]
+            async with self.pool.acquire() as connection:
+                async with connection.transaction():
+                    await connection.execute(
+                        "DELETE FROM emoji_unlocks WHERE guild_id = $1;",
+                        guild_id,
+                    )
+                    await connection.executemany(
+                        """
+                        INSERT INTO emoji_unlocks (
+                            guild_id, emoji, nickname_badge, required_level
+                        )
+                        VALUES ($1, $2, $3, $4);
+                        """,
+                        [
+                            (guild_id, emoji, emoji, required_level)
+                            for required_level, emoji in DEFAULT_PARSED_EMOJI_UNLOCKS
+                        ],
+                    )
+                    await connection.execute(
+                        """
+                        UPDATE voice_levels
+                        SET selected_emoji = ''
+                        WHERE guild_id = $1
+                          AND selected_emoji <> $2
+                          AND NOT (selected_emoji = ANY($3::TEXT[]));
+                        """,
+                        guild_id,
+                        NO_EMOJI_SELECTION,
+                        default_emojis,
+                    )
+                    await connection.execute(
+                        """
+                        INSERT INTO bot_migrations (guild_id, migration_key)
+                        VALUES ($1, $2)
+                        ON CONFLICT (guild_id, migration_key) DO NOTHING;
+                        """,
+                        guild_id,
+                        progression_migration_key,
                     )
 
         rows = await self.pool.fetch(
