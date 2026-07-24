@@ -42,13 +42,12 @@ MIN_HUMANS_IN_VC = max(1, int(os.getenv("MIN_HUMANS_IN_VC", "1")))
 REQUIRE_UNMUTED = env_flag("REQUIRE_UNMUTED", default=False)
 SYNC_NICKNAMES_ON_START = env_flag("SYNC_NICKNAMES_ON_START", default=True)
 
-# Default standard Unicode emoji badges. These are used only to seed a server's
-# database the first time it uses the system. After that, server managers can
-# change the list at any time with /emojiadmin commands without redeploying.
-# Optional Railway format: level=emoji,level=emoji (example: 0=🌱,1=⭐,2=🔥,5=✨)
+# Default Unicode badge entries. These seed each server's database once.
+# Managers can later replace the message/menu emoji with either a Unicode emoji
+# or a Discord custom emoji code such as <:purplegem:123456789012345678>.
+# Discord does not render custom emoji markup inside nicknames, so every custom
+# emoji entry also stores a short Unicode nickname fallback.
 DEFAULT_EMOJI_UNLOCKS = (
-    # Discord nicknames cannot display uploaded image files or custom server
-    # emojis, so the closest standard Unicode colored-circle emojis are used.
     # Levels 0, 1, and 2 unlock immediately, then badges unlock every 5 levels.
     "0=⚪,1=🟣,2=🔴,5=🟢,10=🟤,15=⚫,20=🔵,25=🟡,30=🟠,"
     "35=⭐,40=💎,45=⚡,50=🌙,55=🪐,60=👑,65=🌟,70=🏆,"
@@ -113,10 +112,16 @@ if HOURS_PER_LEVEL < 0:
 
 SUPERSCRIPT_TABLE = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
 SUPERSCRIPT_SUFFIX_RE = re.compile(r"\s*[⁰¹²³⁴⁵⁶⁷⁸⁹]+$")
-# Remove either │Name⁰ or Emoji│Name⁰ when rebuilding a managed nickname.
+# Remove either │Name⁰ or Badge│Name⁰ when rebuilding a managed nickname.
 MANAGED_PREFIX_RE = re.compile(r"^\s*[^│]{0,16}│\s*")
+CUSTOM_EMOJI_CODE_RE = re.compile(
+    r"^<a?:[A-Za-z0-9_]{2,32}:\d{15,22}>$"
+)
 NICKNAME_PREFIX = "│"
 NICKNAME_MAX_LENGTH = 32
+
+# (required_level, display_emoji, nickname_badge)
+EmojiUnlock = tuple[int, str, str]
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS voice_levels (
@@ -139,9 +144,18 @@ ON voice_levels (guild_id, total_voice_seconds DESC);
 CREATE TABLE IF NOT EXISTS emoji_unlocks (
     guild_id BIGINT NOT NULL,
     emoji TEXT NOT NULL,
+    nickname_badge TEXT NOT NULL DEFAULT '',
     required_level INTEGER NOT NULL CHECK (required_level >= 0),
     PRIMARY KEY (guild_id, emoji)
 );
+
+ALTER TABLE emoji_unlocks
+ADD COLUMN IF NOT EXISTS nickname_badge TEXT NOT NULL DEFAULT '';
+
+-- Existing Unicode entries can use themselves as their nickname badge.
+UPDATE emoji_unlocks
+SET nickname_badge = emoji
+WHERE nickname_badge = '';
 
 CREATE INDEX IF NOT EXISTS emoji_unlocks_guild_level_idx
 ON emoji_unlocks (guild_id, required_level, emoji);
@@ -253,41 +267,85 @@ def clean_base_name(name: str) -> str:
     return cleaned or "Member"
 
 
-def validate_emoji_badge(emoji: str) -> str:
-    """Validate a Unicode nickname badge supplied by a manager."""
+def is_custom_emoji_code(value: str) -> bool:
+    return bool(CUSTOM_EMOJI_CODE_RE.fullmatch(value.strip()))
+
+
+def validate_display_emoji(emoji: str) -> str:
+    """Validate a Unicode emoji or Discord custom emoji code used in messages."""
     emoji = emoji.strip()
     if not emoji:
         raise ValueError("The emoji cannot be empty.")
     if NICKNAME_PREFIX in emoji:
         raise ValueError(f"The emoji cannot contain `{NICKNAME_PREFIX}`.")
+    if is_custom_emoji_code(emoji):
+        return emoji
     if emoji.startswith("<:") or emoji.startswith("<a:"):
         raise ValueError(
-            "Discord custom emoji codes do not render as emojis in nicknames. "
-            "Use a standard Unicode emoji instead."
+            "That custom emoji code is malformed. Use a code like "
+            "`<:name:123456789012345678>` or `<a:name:123456789012345678>`."
         )
     if len(emoji) > 8:
-        raise ValueError("That emoji is too long for a nickname badge.")
+        raise ValueError(
+            "Standard nickname emojis must be 8 characters or fewer. "
+            "For a Discord custom emoji, paste its full `<:name:id>` code."
+        )
     return emoji
 
 
+def validate_nickname_badge(badge: str) -> str:
+    """Validate the compact Unicode fallback that actually appears in nicknames."""
+    badge = badge.strip()
+    if not badge:
+        raise ValueError("The nickname badge cannot be empty.")
+    if NICKNAME_PREFIX in badge:
+        raise ValueError(f"The nickname badge cannot contain `{NICKNAME_PREFIX}`.")
+    if badge.startswith("<:") or badge.startswith("<a:"):
+        raise ValueError(
+            "Discord custom emoji codes do not render inside nicknames. "
+            "Choose a short Unicode fallback such as `💎`, `🔴`, or `◆`."
+        )
+    if len(badge) > 8:
+        raise ValueError("The nickname badge must be 8 characters or fewer.")
+    return badge
+
+
 def emoji_required_level(
-    unlocks: tuple[tuple[int, str], ...],
+    unlocks: tuple[EmojiUnlock, ...],
     emoji: str,
 ) -> int | None:
     return next(
-        (required_level for required_level, configured in unlocks if configured == emoji),
+        (
+            required_level
+            for required_level, configured, _nickname_badge in unlocks
+            if configured == emoji
+        ),
         None,
+    )
+
+
+def emoji_nickname_badge(
+    unlocks: tuple[EmojiUnlock, ...],
+    emoji: str,
+) -> str:
+    return next(
+        (
+            nickname_badge
+            for _required_level, configured, nickname_badge in unlocks
+            if configured == emoji
+        ),
+        "",
     )
 
 
 def unlocked_emojis(
     level: int,
-    unlocks: tuple[tuple[int, str], ...],
-) -> tuple[tuple[int, str], ...]:
+    unlocks: tuple[EmojiUnlock, ...],
+) -> tuple[EmojiUnlock, ...]:
     """Return every configured emoji badge unlocked at the supplied level."""
     return tuple(
-        (required_level, emoji)
-        for required_level, emoji in unlocks
+        (required_level, emoji, nickname_badge)
+        for required_level, emoji, nickname_badge in unlocks
         if level >= required_level
     )
 
@@ -295,9 +353,9 @@ def unlocked_emojis(
 def valid_selected_emoji(
     selected_emoji: str | None,
     level: int,
-    unlocks: tuple[tuple[int, str], ...],
+    unlocks: tuple[EmojiUnlock, ...],
 ) -> str:
-    """Return the selected emoji only when it exists and is unlocked."""
+    """Return the selected display emoji only when it exists and is unlocked."""
     emoji = (selected_emoji or "").strip()
     required_level = emoji_required_level(unlocks, emoji)
     if required_level is None or level < required_level:
@@ -307,11 +365,11 @@ def valid_selected_emoji(
 
 def next_emoji_unlock(
     level: int,
-    unlocks: tuple[tuple[int, str], ...],
-) -> tuple[int, str] | None:
-    for required_level, emoji in unlocks:
+    unlocks: tuple[EmojiUnlock, ...],
+) -> EmojiUnlock | None:
+    for required_level, emoji, nickname_badge in unlocks:
         if required_level > level:
-            return required_level, emoji
+            return required_level, emoji, nickname_badge
     return None
 
 
@@ -319,14 +377,15 @@ def nickname_with_level(
     member: discord.Member,
     level: int,
     selected_emoji: str = "",
-    unlocks: tuple[tuple[int, str], ...] = (),
+    unlocks: tuple[EmojiUnlock, ...] = (),
 ) -> str:
-    """Return Emoji│ExampleName⁰, or │ExampleName⁰ when no badge is equipped."""
+    """Return Badge│ExampleName⁰, or │ExampleName⁰ with no equipped badge."""
     current_name = member.nick or member.global_name or member.name
     base_name = clean_base_name(current_name)
     suffix = superscript_number(level)
-    emoji = valid_selected_emoji(selected_emoji, level, unlocks)
-    prefix = f"{emoji}{NICKNAME_PREFIX}"
+    display_emoji = valid_selected_emoji(selected_emoji, level, unlocks)
+    nickname_badge = emoji_nickname_badge(unlocks, display_emoji)
+    prefix = f"{nickname_badge}{NICKNAME_PREFIX}"
     max_base_length = max(
         1,
         NICKNAME_MAX_LENGTH - len(prefix) - len(suffix),
@@ -384,7 +443,7 @@ class VoiceLevelBot(commands.Bot):
         self._last_tick_monotonic: float | None = None
         self._nickname_edits: set[tuple[int, int]] = set()
         self._startup_sync_started = False
-        self._emoji_unlock_cache: dict[int, tuple[tuple[int, str], ...]] = {}
+        self._emoji_unlock_cache: dict[int, tuple[EmojiUnlock, ...]] = {}
 
     async def setup_hook(self) -> None:
         dsn = normalize_neon_dsn(DATABASE_URL)
@@ -437,7 +496,7 @@ class VoiceLevelBot(commands.Bot):
     async def get_emoji_unlocks(
         self,
         guild_id: int,
-    ) -> tuple[tuple[int, str], ...]:
+    ) -> tuple[EmojiUnlock, ...]:
         """Load a server's emoji unlocks, seeding defaults on first use."""
         cached = self._emoji_unlock_cache.get(guild_id)
         if cached is not None:
@@ -445,7 +504,7 @@ class VoiceLevelBot(commands.Bot):
 
         rows = await self.pool.fetch(
             """
-            SELECT required_level, emoji
+            SELECT required_level, emoji, nickname_badge
             FROM emoji_unlocks
             WHERE guild_id = $1
             ORDER BY required_level ASC, emoji ASC;
@@ -455,18 +514,23 @@ class VoiceLevelBot(commands.Bot):
         if not rows:
             await self.pool.executemany(
                 """
-                INSERT INTO emoji_unlocks (guild_id, emoji, required_level)
-                VALUES ($1, $2, $3)
+                INSERT INTO emoji_unlocks (
+                    guild_id,
+                    emoji,
+                    nickname_badge,
+                    required_level
+                )
+                VALUES ($1, $2, $3, $4)
                 ON CONFLICT (guild_id, emoji) DO NOTHING;
                 """,
                 [
-                    (guild_id, emoji, required_level)
+                    (guild_id, emoji, emoji, required_level)
                     for required_level, emoji in DEFAULT_PARSED_EMOJI_UNLOCKS
                 ],
             )
             rows = await self.pool.fetch(
                 """
-                SELECT required_level, emoji
+                SELECT required_level, emoji, nickname_badge
                 FROM emoji_unlocks
                 WHERE guild_id = $1
                 ORDER BY required_level ASC, emoji ASC;
@@ -475,7 +539,11 @@ class VoiceLevelBot(commands.Bot):
             )
 
         unlocks = tuple(
-            (int(row["required_level"]), str(row["emoji"]))
+            (
+                int(row["required_level"]),
+                str(row["emoji"]),
+                str(row["nickname_badge"]),
+            )
             for row in rows
         )
         self._emoji_unlock_cache[guild_id] = unlocks
@@ -489,22 +557,48 @@ class VoiceLevelBot(commands.Bot):
         guild_id: int,
         emoji: str,
         required_level: int,
-    ) -> None:
-        emoji = validate_emoji_badge(emoji)
+        nickname_badge: str | None = None,
+    ) -> str:
+        emoji = validate_display_emoji(emoji)
         if required_level < 0:
             raise ValueError("The required level cannot be negative.")
+
+        existing_badge = await self.pool.fetchval(
+            "SELECT nickname_badge FROM emoji_unlocks "
+            "WHERE guild_id = $1 AND emoji = $2;",
+            guild_id,
+            emoji,
+        )
+        if nickname_badge is None or not nickname_badge.strip():
+            if existing_badge:
+                nickname_badge = str(existing_badge)
+            elif is_custom_emoji_code(emoji):
+                nickname_badge = "◆"
+            else:
+                nickname_badge = emoji
+        nickname_badge = validate_nickname_badge(nickname_badge)
+
         await self.pool.execute(
             """
-            INSERT INTO emoji_unlocks (guild_id, emoji, required_level)
-            VALUES ($1, $2, $3)
+            INSERT INTO emoji_unlocks (
+                guild_id,
+                emoji,
+                nickname_badge,
+                required_level
+            )
+            VALUES ($1, $2, $3, $4)
             ON CONFLICT (guild_id, emoji)
-            DO UPDATE SET required_level = EXCLUDED.required_level;
+            DO UPDATE SET
+                nickname_badge = EXCLUDED.nickname_badge,
+                required_level = EXCLUDED.required_level;
             """,
             guild_id,
             emoji,
+            nickname_badge,
             required_level,
         )
         self.invalidate_emoji_unlocks(guild_id)
+        return nickname_badge
 
     async def remove_emoji_unlock(self, guild_id: int, emoji: str) -> bool:
         emoji = emoji.strip()
@@ -533,19 +627,28 @@ class VoiceLevelBot(commands.Bot):
         old_emoji: str,
         new_emoji: str,
         required_level: int,
-    ) -> bool:
+        nickname_badge: str | None = None,
+    ) -> tuple[bool, str]:
         old_emoji = old_emoji.strip()
-        new_emoji = validate_emoji_badge(new_emoji)
+        new_emoji = validate_display_emoji(new_emoji)
         if required_level < 0:
             raise ValueError("The required level cannot be negative.")
 
-        exists = await self.pool.fetchval(
-            "SELECT 1 FROM emoji_unlocks WHERE guild_id = $1 AND emoji = $2;",
+        old_row = await self.pool.fetchrow(
+            "SELECT nickname_badge FROM emoji_unlocks "
+            "WHERE guild_id = $1 AND emoji = $2;",
             guild_id,
             old_emoji,
         )
-        if not exists:
-            return False
+        if old_row is None:
+            return False, ""
+
+        if nickname_badge is None or not nickname_badge.strip():
+            if is_custom_emoji_code(new_emoji):
+                nickname_badge = str(old_row["nickname_badge"] or "◆")
+            else:
+                nickname_badge = new_emoji
+        nickname_badge = validate_nickname_badge(nickname_badge)
 
         async with self.pool.acquire() as connection:
             async with connection.transaction():
@@ -556,13 +659,21 @@ class VoiceLevelBot(commands.Bot):
                 )
                 await connection.execute(
                     """
-                    INSERT INTO emoji_unlocks (guild_id, emoji, required_level)
-                    VALUES ($1, $2, $3)
+                    INSERT INTO emoji_unlocks (
+                        guild_id,
+                        emoji,
+                        nickname_badge,
+                        required_level
+                    )
+                    VALUES ($1, $2, $3, $4)
                     ON CONFLICT (guild_id, emoji)
-                    DO UPDATE SET required_level = EXCLUDED.required_level;
+                    DO UPDATE SET
+                        nickname_badge = EXCLUDED.nickname_badge,
+                        required_level = EXCLUDED.required_level;
                     """,
                     guild_id,
                     new_emoji,
+                    nickname_badge,
                     required_level,
                 )
                 await connection.execute(
@@ -577,7 +688,7 @@ class VoiceLevelBot(commands.Bot):
                 )
 
         self.invalidate_emoji_unlocks(guild_id)
-        return True
+        return True, nickname_badge
 
     async def reset_emoji_unlocks(self, guild_id: int) -> None:
         default_emojis = [emoji for _, emoji in DEFAULT_PARSED_EMOJI_UNLOCKS]
@@ -589,11 +700,16 @@ class VoiceLevelBot(commands.Bot):
                 )
                 await connection.executemany(
                     """
-                    INSERT INTO emoji_unlocks (guild_id, emoji, required_level)
-                    VALUES ($1, $2, $3);
+                    INSERT INTO emoji_unlocks (
+                        guild_id,
+                        emoji,
+                        nickname_badge,
+                        required_level
+                    )
+                    VALUES ($1, $2, $3, $4);
                     """,
                     [
-                        (guild_id, emoji, required_level)
+                        (guild_id, emoji, emoji, required_level)
                         for required_level, emoji in DEFAULT_PARSED_EMOJI_UNLOCKS
                     ],
                 )
@@ -803,7 +919,7 @@ class VoiceLevelBot(commands.Bot):
         unlocks = await self.get_emoji_unlocks(member.guild.id)
         newly_unlocked = [
             emoji
-            for required_level, emoji in unlocks
+            for required_level, emoji, _nickname_badge in unlocks
             if old_level < required_level <= new_level
         ]
         message = (
@@ -1091,7 +1207,8 @@ async def rank(
     unlocked = unlocked_emojis(level, unlocks)
     badge_lines = [
         f"Equipped: **{selected_emoji or 'None'}**",
-        "Unlocked: " + (" ".join(emoji for _, emoji in unlocked) or "None yet"),
+        "Unlocked: "
+        + (" ".join(emoji for _, emoji, _nickname_badge in unlocked) or "None yet"),
     ]
     if next_unlock is not None:
         badge_lines.append(
@@ -1266,8 +1383,13 @@ async def emoji_badge_autocomplete(
     current_lower = current.casefold().strip()
     choices: list[app_commands.Choice[str]] = []
 
-    for required_level, emoji in unlocked_emojis(level, unlocks):
-        label = f"{emoji} — unlocked at Level {required_level}"
+    for required_level, emoji, nickname_badge in unlocked_emojis(level, unlocks):
+        fallback = (
+            f" · nickname {nickname_badge}"
+            if is_custom_emoji_code(emoji)
+            else ""
+        )
+        label = f"{emoji} — Level {required_level}{fallback}"
         if current_lower and current_lower not in label.casefold():
             continue
         choices.append(app_commands.Choice(name=label, value=emoji))
@@ -1298,12 +1420,17 @@ async def emoji_list(interaction: discord.Interaction) -> None:
     selected_emoji = valid_selected_emoji(row["selected_emoji"], level, unlocks)
 
     lines: list[str] = []
-    for required_level, emoji in unlocks:
+    for required_level, emoji, nickname_badge in unlocks:
         unlocked = level >= required_level
         status = "✅ Unlocked" if unlocked else "🔒 Locked"
         equipped = " — **equipped**" if emoji == selected_emoji else ""
+        fallback = (
+            f" — nickname badge `{nickname_badge}`"
+            if is_custom_emoji_code(emoji)
+            else ""
+        )
         lines.append(
-            f"{emoji} — Level **{required_level}** — {status}{equipped}"
+            f"{emoji} — Level **{required_level}** — {status}{fallback}{equipped}"
         )
 
     embed = discord.Embed(
@@ -1454,8 +1581,7 @@ bot.tree.add_command(emoji_group)
 
 emoji_admin_group = app_commands.Group(
     name="emojiadmin",
-    description="Manage this server's level-unlocked nickname emojis.",
-    default_permissions=discord.Permissions(manage_guild=True),
+    description="View or manage this server's level-unlocked nickname emojis.",
 )
 
 
@@ -1473,41 +1599,61 @@ async def configured_emoji_autocomplete(
 
     current_lower = current.casefold().strip()
     choices: list[app_commands.Choice[str]] = []
-    for required_level, emoji in unlocks:
-        label = f"{emoji} — Level {required_level}"
+    for required_level, emoji, nickname_badge in unlocks:
+        fallback = (
+            f" · nickname {nickname_badge}"
+            if is_custom_emoji_code(emoji)
+            else ""
+        )
+        label = f"{emoji} — Level {required_level}{fallback}"
         if current_lower and current_lower not in label.casefold():
             continue
-        choices.append(app_commands.Choice(name=label, value=emoji))
+        choices.append(app_commands.Choice(name=label[:100], value=emoji))
     return choices[:25]
 
 
 @emoji_admin_group.command(
     name="set",
-    description="Add an emoji unlock or change its required level.",
+    description="Add an emoji unlock or change its level and nickname fallback.",
 )
 @app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
 @app_commands.checks.has_permissions(manage_guild=True)
 @app_commands.describe(
-    emoji="A standard Unicode emoji, such as ⭐",
+    emoji="Unicode emoji or Discord code like <:gem:123456789012345678>",
     level="The level members must reach to unlock it",
+    nickname_badge="Unicode shown in nicknames; custom codes cannot render there",
 )
 async def emoji_admin_set(
     interaction: discord.Interaction,
     emoji: str,
     level: app_commands.Range[int, 0, 100000],
+    nickname_badge: str | None = None,
 ) -> None:
     assert interaction.guild is not None
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
-        emoji = validate_emoji_badge(emoji)
-        await bot.set_emoji_unlock(interaction.guild.id, emoji, int(level))
+        emoji = validate_display_emoji(emoji)
+        saved_badge = await bot.set_emoji_unlock(
+            interaction.guild.id,
+            emoji,
+            int(level),
+            nickname_badge,
+        )
     except ValueError as exc:
         await interaction.followup.send(str(exc), ephemeral=True)
         return
 
     updated, unchanged, skipped = await bot.sync_guild_nicknames(interaction.guild)
+    custom_note = (
+        f" Discord will show `{saved_badge}` in nicknames because custom emoji "
+        "codes only render in messages."
+        if is_custom_emoji_code(emoji)
+        else ""
+    )
     await interaction.followup.send(
-        f"Saved {emoji} at **Level {level}**. "
+        f"Saved {emoji} at **Level {level}** with nickname badge "
+        f"`{saved_badge}`.{custom_note}\n"
         f"Nicknames updated: **{updated}**, already correct: **{unchanged}**, "
         f"skipped: **{skipped}**.",
         ephemeral=True,
@@ -1516,14 +1662,16 @@ async def emoji_admin_set(
 
 @emoji_admin_group.command(
     name="replace",
-    description="Replace an existing emoji while preserving member selections.",
+    description="Replace an old emoji/code while preserving member selections.",
 )
 @app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
 @app_commands.checks.has_permissions(manage_guild=True)
 @app_commands.describe(
-    old_emoji="The current configured emoji",
-    new_emoji="The new standard Unicode emoji",
+    old_emoji="The current configured emoji or custom emoji code",
+    new_emoji="The new Unicode emoji or full Discord custom emoji code",
     level="The new required level",
+    nickname_badge="Unicode shown in nicknames; blank keeps the old fallback",
 )
 @app_commands.autocomplete(old_emoji=configured_emoji_autocomplete)
 async def emoji_admin_replace(
@@ -1531,15 +1679,17 @@ async def emoji_admin_replace(
     old_emoji: str,
     new_emoji: str,
     level: app_commands.Range[int, 0, 100000],
+    nickname_badge: str | None = None,
 ) -> None:
     assert interaction.guild is not None
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
-        changed = await bot.replace_emoji_unlock(
+        changed, saved_badge = await bot.replace_emoji_unlock(
             interaction.guild.id,
             old_emoji,
             new_emoji,
             int(level),
+            nickname_badge,
         )
     except ValueError as exc:
         await interaction.followup.send(str(exc), ephemeral=True)
@@ -1553,10 +1703,15 @@ async def emoji_admin_replace(
         return
 
     updated, unchanged, skipped = await bot.sync_guild_nicknames(interaction.guild)
+    custom_note = (
+        f" Nicknames use `{saved_badge}` as the Unicode fallback."
+        if is_custom_emoji_code(new_emoji)
+        else ""
+    )
     await interaction.followup.send(
-        f"Replaced {old_emoji} with {new_emoji} at **Level {level}**. "
-        f"Nicknames updated: **{updated}**, already correct: **{unchanged}**, "
-        f"skipped: **{skipped}**.",
+        f"Replaced {old_emoji} with {new_emoji} at **Level {level}**."
+        f"{custom_note}\nNicknames updated: **{updated}**, already correct: "
+        f"**{unchanged}**, skipped: **{skipped}**.",
         ephemeral=True,
     )
 
@@ -1566,8 +1721,9 @@ async def emoji_admin_replace(
     description="Remove an emoji unlock from this server.",
 )
 @app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
 @app_commands.checks.has_permissions(manage_guild=True)
-@app_commands.describe(emoji="The configured emoji to remove")
+@app_commands.describe(emoji="The configured emoji or custom emoji code to remove")
 @app_commands.autocomplete(emoji=configured_emoji_autocomplete)
 async def emoji_admin_remove(
     interaction: discord.Interaction,
@@ -1606,21 +1762,27 @@ async def emoji_admin_remove(
     description="List this server's configured emoji unlocks.",
 )
 @app_commands.guild_only()
-@app_commands.checks.has_permissions(manage_guild=True)
 async def emoji_admin_list(interaction: discord.Interaction) -> None:
+    """This is the only /emojiadmin subcommand available to every member."""
     assert interaction.guild is not None
     unlocks = await bot.get_emoji_unlocks(interaction.guild.id)
-    lines = [
-        f"{emoji} — Level **{required_level}**"
-        for required_level, emoji in unlocks
-    ]
+    lines: list[str] = []
+    for required_level, emoji, nickname_badge in unlocks:
+        custom_label = " custom" if is_custom_emoji_code(emoji) else ""
+        lines.append(
+            f"{emoji} — Level **{required_level}** — nickname "
+            f"`{nickname_badge}`{custom_label}"
+        )
     embed = discord.Embed(
         title="Server Emoji Unlock Settings",
         description="\n".join(lines) or "No emoji unlocks configured.",
         color=discord.Color.blurple(),
     )
     embed.set_footer(
-        text="Use /emojiadmin set, replace, remove, or reset to change this list."
+        text=(
+            "Everyone can use this list. Only members with Manage Server can "
+            "use set, replace, remove, or reset."
+        )
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -1630,6 +1792,7 @@ async def emoji_admin_list(interaction: discord.Interaction) -> None:
     description="Reset this server's emoji unlocks to the default list.",
 )
 @app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
 @app_commands.checks.has_permissions(manage_guild=True)
 @app_commands.describe(confirm="Set this to True to confirm the reset")
 async def emoji_admin_reset(
@@ -1655,6 +1818,7 @@ async def emoji_admin_reset(
 
 
 bot.tree.add_command(emoji_admin_group)
+
 
 
 @bot.tree.command(
@@ -1708,9 +1872,11 @@ async def level_status(interaction: discord.Interaction) -> None:
     unlocks = await bot.get_emoji_unlocks(interaction.guild.id)
     unlock_text = " ".join(
         f"{emoji}=L{required_level}"
-        for required_level, emoji in unlocks
+        for required_level, emoji, _nickname_badge in unlocks
     ) or "None configured"
-    example_level, example_emoji = unlocks[0] if unlocks else (0, "⭐")
+    example_level, example_emoji, example_badge = (
+        unlocks[0] if unlocks else (0, "⭐", "⭐")
+    )
     embed.add_field(
         name="Emoji unlocks",
         value=unlock_text,
@@ -1720,8 +1886,9 @@ async def level_status(interaction: discord.Interaction) -> None:
         name="Expected nickname",
         value=(
             f"No badge: `{NICKNAME_PREFIX}ExampleName{superscript_number(0)}`\n"
-            f"With badge: `{example_emoji}{NICKNAME_PREFIX}"
-            f"ExampleName{superscript_number(example_level)}`"
+            f"With badge: `{example_badge}{NICKNAME_PREFIX}"
+            f"ExampleName{superscript_number(example_level)}`\n"
+            f"Menu/message emoji: {example_emoji}"
         ),
         inline=False,
     )
