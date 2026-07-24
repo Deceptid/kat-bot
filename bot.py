@@ -45,8 +45,15 @@ SYNC_NICKNAMES_ON_START = env_flag("SYNC_NICKNAMES_ON_START", default=True)
 # Default standard Unicode emoji badges. These are used only to seed a server's
 # database the first time it uses the system. After that, server managers can
 # change the list at any time with /emojiadmin commands without redeploying.
-# Optional Railway format: level=emoji,level=emoji (example: 5=⭐,10=🔥)
-DEFAULT_EMOJI_UNLOCKS = "5=⭐,10=🔥,20=💎,30=⚡,50=👑,75=🌟,100=🏆"
+# Optional Railway format: level=emoji,level=emoji (example: 0=🌱,1=⭐,2=🔥,5=✨)
+DEFAULT_EMOJI_UNLOCKS = (
+    # Discord nicknames cannot display uploaded image files or custom server
+    # emojis, so the closest standard Unicode colored-circle emojis are used.
+    # Levels 0, 1, and 2 unlock immediately, then badges unlock every 5 levels.
+    "0=⚪,1=🟣,2=🔴,5=🟢,10=🟤,15=⚫,20=🔵,25=🟡,30=🟠,"
+    "35=⭐,40=💎,45=⚡,50=🌙,55=🪐,60=👑,65=🌟,70=🏆,"
+    "75=🐉,80=💠,85=🦅,90=☄️,95=🔱,100=🌌"
+)
 
 
 def parse_emoji_unlocks(raw: str) -> tuple[tuple[int, str], ...]:
