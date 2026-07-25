@@ -15,6 +15,12 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
+if not hasattr(discord.ui, "LayoutView"):
+    raise RuntimeError(
+        "The inline Nickname Studio requires discord.py 2.6 or newer. "
+        "Update your dependency to discord.py>=2.6."
+    )
+
 load_dotenv()
 
 logging.basicConfig(
@@ -1895,24 +1901,163 @@ class EmojiChoiceView(discord.ui.View):
         )
 
 
-class EmojiControlPanelView(discord.ui.View):
-    """Persistent public Nickname Studio; member actions respond privately."""
+class NicknamePanelButton(discord.ui.Button):
+    """Button accessory displayed beside one Nickname Studio section."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        action: str,
+        label: str,
+        emoji: str,
+        style: discord.ButtonStyle,
+        custom_id: str,
+    ) -> None:
+        super().__init__(
+            label=label,
+            emoji=emoji,
+            style=style,
+            custom_id=custom_id,
+        )
+        self.action = action
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        panel = self.view
+        if not isinstance(panel, EmojiControlPanelView):
+            await interaction.response.send_message(
+                "This control panel is no longer connected correctly. Ask an admin "
+                "to post a new one with `/emojiadmin panel`.",
+                ephemeral=True,
+            )
+            return
+
+        if self.action == "vault":
+            await panel.open_emoji_menu(interaction)
+        elif self.action == "auto":
+            await panel.toggle_auto_emoji(interaction)
+        elif self.action == "card":
+            await panel.view_nickname_card(interaction)
+        else:
+            await interaction.response.send_message(
+                "That panel action is not available.",
+                ephemeral=True,
+            )
+
+
+class EmojiControlPanelView(discord.ui.LayoutView):
+    """Persistent Components V2 Nickname Studio with inline section buttons."""
+
+    def __init__(
+        self,
+        guild_name: str = "YOUR SERVER",
+        thumbnail_url: str | None = None,
+    ) -> None:
         super().__init__(timeout=None)
 
-    @discord.ui.button(
-        label="Open Badge Vault",
-        style=discord.ButtonStyle.success,
-        emoji="💠",
-        row=0,
-        custom_id="voicelevels:emoji_panel:open",
-    )
-    async def open_emoji_menu(
-        self,
-        interaction: discord.Interaction,
-        _button: discord.ui.Button,
-    ) -> None:
+        vault_button = NicknamePanelButton(
+            action="vault",
+            label="Open",
+            emoji="💠",
+            style=discord.ButtonStyle.success,
+            custom_id="voicelevels:emoji_panel:open",
+        )
+        auto_button = NicknamePanelButton(
+            action="auto",
+            label="Toggle",
+            emoji="⚡",
+            style=discord.ButtonStyle.primary,
+            custom_id="voicelevels:emoji_panel:auto",
+        )
+        card_button = NicknamePanelButton(
+            action="card",
+            label="View",
+            emoji="📇",
+            style=discord.ButtonStyle.secondary,
+            custom_id="voicelevels:emoji_panel:status",
+        )
+
+        panel = discord.ui.Container(
+            accent_color=discord.Color.from_rgb(118, 82, 255),
+        )
+
+        header_text = (
+            f"### ✦ {guild_name} · MEMBER CUSTOMIZATION\n"
+            "# NICKNAME STUDIO\n"
+            "Build a nickname style that grows with your voice level. "
+            "Every action opens privately for you."
+        )
+        if thumbnail_url:
+            panel.add_item(
+                discord.ui.Section(
+                    header_text,
+                    accessory=discord.ui.Thumbnail(
+                        thumbnail_url,
+                        description="Nickname Studio",
+                    ),
+                )
+            )
+        else:
+            panel.add_item(discord.ui.TextDisplay(header_text))
+
+        panel.add_item(
+            discord.ui.Separator(
+                visible=True,
+                spacing=discord.SeparatorSpacing.large,
+            )
+        )
+        panel.add_item(
+            discord.ui.Section(
+                "### 💠 BADGE VAULT",
+                "Browse every emoji badge you have unlocked and lock your favorite "
+                "beside your nickname. Your badge menu is visible only to you.",
+                accessory=vault_button,
+            )
+        )
+
+        panel.add_item(
+            discord.ui.Separator(
+                visible=True,
+                spacing=discord.SeparatorSpacing.large,
+            )
+        )
+        panel.add_item(
+            discord.ui.Section(
+                "### ⚡ AUTO UPGRADE",
+                "Keep your badge matched to your newest unlock, or pause the system "
+                "to hold the badge you like. Press again whenever you want to switch back.",
+                accessory=auto_button,
+            )
+        )
+
+        panel.add_item(
+            discord.ui.Separator(
+                visible=True,
+                spacing=discord.SeparatorSpacing.large,
+            )
+        )
+        panel.add_item(
+            discord.ui.Section(
+                "### 📇 NICKNAME CARD",
+                "View your level, current badge, voice time, nickname mode, unlocked "
+                "badge count, and next reward in one private card.",
+                accessory=card_button,
+            )
+        )
+
+        panel.add_item(
+            discord.ui.Separator(
+                visible=False,
+                spacing=discord.SeparatorSpacing.large,
+            )
+        )
+        panel.add_item(
+            discord.ui.TextDisplay(
+                "-# Public studio · Private actions · Only admins can post a new panel"
+            )
+        )
+        self.add_item(panel)
+
+    async def open_emoji_menu(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None or not isinstance(
             interaction.user, discord.Member
         ):
@@ -1973,18 +2118,7 @@ class EmojiControlPanelView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(
-        label="Toggle Auto Upgrade",
-        style=discord.ButtonStyle.primary,
-        emoji="⚡",
-        row=0,
-        custom_id="voicelevels:emoji_panel:auto",
-    )
-    async def toggle_auto_emoji(
-        self,
-        interaction: discord.Interaction,
-        _button: discord.ui.Button,
-    ) -> None:
+    async def toggle_auto_emoji(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None or not isinstance(
             interaction.user, discord.Member
         ):
@@ -2003,7 +2137,6 @@ class EmojiControlPanelView(discord.ui.View):
         raw_selection = str(row["selected_emoji"] or "").strip()
 
         if not raw_selection:
-            # Auto is currently on. Freeze the badge currently being displayed.
             current_badge = valid_selected_emoji("", level, unlocks)
             if not current_badge:
                 await interaction.response.send_message(
@@ -2014,8 +2147,6 @@ class EmojiControlPanelView(discord.ui.View):
             new_selection = current_badge
             auto_enabled = False
         else:
-            # Any explicit selection (including no badge) means auto is paused.
-            # Clearing the value restores highest-unlocked automatic mode.
             new_selection = ""
             auto_enabled = True
 
@@ -2082,18 +2213,7 @@ class EmojiControlPanelView(discord.ui.View):
             )
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @discord.ui.button(
-        label="View My Nickname Card",
-        style=discord.ButtonStyle.secondary,
-        emoji="📇",
-        row=1,
-        custom_id="voicelevels:emoji_panel:status",
-    )
-    async def view_nickname_card(
-        self,
-        interaction: discord.Interaction,
-        _button: discord.ui.Button,
-    ) -> None:
+    async def view_nickname_card(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None or not isinstance(
             interaction.user, discord.Member
         ):
@@ -2254,57 +2374,16 @@ async def configured_emoji_autocomplete(
 @app_commands.checks.has_permissions(manage_guild=True)
 async def emoji_admin_panel(interaction: discord.Interaction) -> None:
     assert interaction.guild is not None
-    embed = discord.Embed(
-        title="✦ NICKNAME STUDIO",
-        description=(
-            "Build a nickname style that grows with your voice level.\n"
-            "Every button opens a **private** menu made only for you."
-        ),
-        color=discord.Color.from_rgb(118, 82, 255),
-    )
 
-    author_name = f"{interaction.guild.name} • Member Customization"
-    if interaction.guild.icon is not None:
-        embed.set_author(name=author_name, icon_url=interaction.guild.icon.url)
-    else:
-        embed.set_author(name=author_name)
-
-    embed.add_field(
-        name="━━  CUSTOMIZE YOUR STYLE  ━━",
-        value=(
-            "💠 **BADGE VAULT**\n"
-            "Browse the emoji badges you have unlocked and lock your favorite "
-            "beside your nickname."
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="━━  SMART NICKNAME MODE  ━━",
-        value=(
-            "⚡ **AUTO UPGRADE**\n"
-            "Keep your badge matched to your newest unlock, or pause it to hold "
-            "the badge you like."
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="━━  YOUR PROFILE  ━━",
-        value=(
-            "📇 **NICKNAME CARD**\n"
-            "View your level, current badge, voice time, mode, and next unlock "
-            "in one private card."
-        ),
-        inline=False,
-    )
-
+    thumbnail_url: str | None = None
     if interaction.client.user is not None:
-        embed.set_thumbnail(url=interaction.client.user.display_avatar.url)
-    embed.set_footer(
-        text="Public panel • Private controls • Only admins can post a new panel"
-    )
+        thumbnail_url = interaction.client.user.display_avatar.url
+
     await interaction.response.send_message(
-        embed=embed,
-        view=EmojiControlPanelView(),
+        view=EmojiControlPanelView(
+            guild_name=interaction.guild.name,
+            thumbnail_url=thumbnail_url,
+        )
     )
 
 
