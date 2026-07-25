@@ -1599,6 +1599,148 @@ async def emoji_badge_autocomplete(
     return choices[:25]
 
 
+def build_emoji_list_embed(
+    *,
+    level: int,
+    unlocks: tuple[EmojiUnlock, ...],
+    selected_emoji: str,
+    page: int,
+) -> tuple[discord.Embed, int]:
+    """Build one of exactly two emoji-list pages."""
+    total_entries = len(unlocks)
+    split_at = max(1, (total_entries + 1) // 2)
+    pages = (
+        unlocks[:split_at],
+        unlocks[split_at:],
+    )
+
+    # Keep the page valid if an admin changes the list while this menu is open.
+    if page == 2 and not pages[1]:
+        page = 1
+
+    page_entries = pages[page - 1]
+    lines: list[str] = []
+    for required_level, emoji, _nickname_badge in page_entries:
+        is_unlocked = level >= required_level
+        status = "✅ Unlocked" if is_unlocked else "🔒 Locked"
+        equipped = " — **EQUIPPED**" if emoji == selected_emoji else ""
+        lines.append(
+            f"{emoji}  ·  Level **{required_level}**  ·  {status}{equipped}"
+        )
+
+    embed = discord.Embed(
+        title="Nickname Emoji Unlocks",
+        description="\n".join(lines) or "*No emoji unlocks on this page.*",
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="Your level", value=f"**{level}**", inline=True)
+    embed.add_field(
+        name="Equipped",
+        value=selected_emoji or "None",
+        inline=True,
+    )
+    embed.add_field(
+        name="Showing",
+        value=f"**Page {page} of 2**",
+        inline=True,
+    )
+    embed.set_footer(
+        text=(
+            "Use the buttons below to switch pages · /emoji equip locks a badge · "
+            "/emoji remove hides badges"
+        )
+    )
+    return embed, page
+
+
+class EmojiListPaginationView(discord.ui.View):
+    """Private two-page navigation for /emoji list."""
+
+    def __init__(self, guild_id: int, user_id: int, page: int = 1) -> None:
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.page = 1 if page != 2 else 2
+        self._update_buttons()
+
+    def _update_buttons(self) -> None:
+        self.page_one.disabled = self.page == 1
+        self.page_two.disabled = self.page == 2
+        self.page_one.style = (
+            discord.ButtonStyle.primary
+            if self.page == 1
+            else discord.ButtonStyle.secondary
+        )
+        self.page_two.style = (
+            discord.ButtonStyle.primary
+            if self.page == 2
+            else discord.ButtonStyle.secondary
+        )
+
+    async def _show_page(
+        self,
+        interaction: discord.Interaction,
+        page: int,
+    ) -> None:
+        if (
+            interaction.guild is None
+            or interaction.guild.id != self.guild_id
+            or interaction.user.id != self.user_id
+            or not isinstance(interaction.user, discord.Member)
+        ):
+            await interaction.response.send_message(
+                "Open `/emoji list` yourself to use these page buttons.",
+                ephemeral=True,
+            )
+            return
+
+        row = await bot.get_or_create_stats(self.guild_id, self.user_id)
+        level = level_from_total_seconds(row["total_voice_seconds"])
+        unlocks = await bot.get_emoji_unlocks(
+            self.guild_id,
+            force_refresh=True,
+        )
+        selected_emoji = valid_selected_emoji(
+            row["selected_emoji"],
+            level,
+            unlocks,
+        )
+
+        embed, resolved_page = build_emoji_list_embed(
+            level=level,
+            unlocks=unlocks,
+            selected_emoji=selected_emoji,
+            page=page,
+        )
+        self.page = resolved_page
+        self._update_buttons()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(
+        label="Page 1",
+        emoji="◀️",
+        style=discord.ButtonStyle.primary,
+    )
+    async def page_one(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        await self._show_page(interaction, 1)
+
+    @discord.ui.button(
+        label="Page 2",
+        emoji="▶️",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def page_two(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        await self._show_page(interaction, 2)
+
+
 @emoji_group.command(
     name="list",
     description="See nickname emojis and the levels needed to unlock them.",
@@ -1618,36 +1760,31 @@ async def emoji_list(interaction: discord.Interaction) -> None:
         interaction.user.id,
     )
     level = level_from_total_seconds(row["total_voice_seconds"])
-    unlocks = await bot.get_emoji_unlocks(interaction.guild.id)
-    selected_emoji = valid_selected_emoji(row["selected_emoji"], level, unlocks)
+    unlocks = await bot.get_emoji_unlocks(
+        interaction.guild.id,
+        force_refresh=True,
+    )
+    selected_emoji = valid_selected_emoji(
+        row["selected_emoji"],
+        level,
+        unlocks,
+    )
 
-    lines: list[str] = []
-    for required_level, emoji, _nickname_badge in unlocks:
-        unlocked = level >= required_level
-        status = "✅ Unlocked" if unlocked else "🔒 Locked"
-        equipped = " — **equipped**" if emoji == selected_emoji else ""
-        lines.append(
-            f"{emoji} — Level **{required_level}** — {status}{equipped}"
-        )
-
-    embed = discord.Embed(
-        title="Nickname Emoji Unlocks",
-        description="\n".join(lines),
-        color=discord.Color.blurple(),
+    embed, page = build_emoji_list_embed(
+        level=level,
+        unlocks=unlocks,
+        selected_emoji=selected_emoji,
+        page=1,
     )
-    embed.add_field(name="Your level", value=f"**{level}**", inline=True)
-    embed.add_field(
-        name="Equipped",
-        value=selected_emoji or "None",
-        inline=True,
+    await interaction.response.send_message(
+        embed=embed,
+        view=EmojiListPaginationView(
+            interaction.guild.id,
+            interaction.user.id,
+            page,
+        ),
+        ephemeral=True,
     )
-    embed.set_footer(
-        text=(
-            "The highest unlocked badge is used automatically. Use /emoji equip "
-            "to keep a specific badge, or /emoji remove to hide badges."
-        )
-    )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @emoji_group.command(
