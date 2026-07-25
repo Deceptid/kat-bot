@@ -511,6 +511,9 @@ class VoiceLevelBot(commands.Bot):
                 )
                 await asyncio.sleep(delay)
 
+        # Register persistent buttons used by public emoji control-panel messages.
+        self.add_view(EmojiControlPanelView())
+
         if TEST_GUILD_ID:
             guild = discord.Object(id=TEST_GUILD_ID)
             self.tree.copy_global_to(guild=guild)
@@ -1760,6 +1763,268 @@ emoji_admin_group = app_commands.Group(
 )
 
 
+class EmojiChoiceSelect(discord.ui.Select):
+    """Private member-specific dropdown opened from the public control panel."""
+
+    def __init__(
+        self,
+        guild_id: int,
+        user_id: int,
+        unlocks: tuple[EmojiUnlock, ...],
+        selected_emoji: str,
+    ) -> None:
+        self.guild_id = guild_id
+        self.user_id = user_id
+
+        # Discord allows at most 25 select options. Prefer the newest/highest
+        # unlocked badges if a server configured more than that.
+        visible_unlocks = list(unlocks)[-25:]
+        options = [
+            discord.SelectOption(
+                label=f"{emoji}  Level {required_level}",
+                value=emoji,
+                default=(selected_emoji == emoji),
+            )
+            for required_level, emoji, _nickname_badge in visible_unlocks
+        ]
+        super().__init__(
+            placeholder="Choose an unlocked nickname emoji",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="voicelevels:emoji_panel:choice",
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or interaction.guild.id != self.guild_id:
+            await interaction.response.send_message(
+                "This emoji menu belongs to a different server.",
+                ephemeral=True,
+            )
+            return
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "Open the control panel yourself to change your nickname emoji.",
+                ephemeral=True,
+            )
+            return
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "This control only works inside a server.",
+                ephemeral=True,
+            )
+            return
+
+        badge = self.values[0].strip()
+        row = await bot.get_or_create_stats(self.guild_id, self.user_id)
+        level = level_from_total_seconds(row["total_voice_seconds"])
+        unlocks = await bot.get_emoji_unlocks(self.guild_id)
+        required_level = emoji_required_level(unlocks, badge)
+
+        if required_level is None or level < required_level:
+            await interaction.response.send_message(
+                "That badge is no longer available or has not been unlocked yet.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+        await bot.pool.execute(
+            "UPDATE voice_levels SET selected_emoji = $1 "
+            "WHERE guild_id = $2 AND user_id = $3;",
+            badge,
+            self.guild_id,
+            self.user_id,
+        )
+        result = await bot.apply_level_nickname(
+            interaction.user,
+            level,
+            badge,
+        )
+        if result in {"updated", "unchanged"}:
+            await bot.mark_nickname_synced(self.guild_id, self.user_id, level)
+            message = (
+                f"Equipped {badge}. **Automatic emoji changes are now OFF**, "
+                "so this badge will stay selected until you change it or turn auto back on."
+            )
+        else:
+            message = (
+                f"Saved {badge}, but I could not edit your nickname. Make sure the bot "
+                "has **Manage Nicknames** and its role is above your highest role."
+            )
+
+        await interaction.edit_original_response(
+            content=message,
+            embed=None,
+            view=None,
+        )
+
+
+class EmojiChoiceView(discord.ui.View):
+    def __init__(
+        self,
+        guild_id: int,
+        user_id: int,
+        unlocks: tuple[EmojiUnlock, ...],
+        selected_emoji: str,
+    ) -> None:
+        super().__init__(timeout=180)
+        self.add_item(
+            EmojiChoiceSelect(guild_id, user_id, unlocks, selected_emoji)
+        )
+
+
+class EmojiControlPanelView(discord.ui.View):
+    """Persistent public panel; member actions respond privately."""
+
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Change Emoji",
+        style=discord.ButtonStyle.primary,
+        emoji="🎨",
+        custom_id="voicelevels:emoji_panel:open",
+    )
+    async def open_emoji_menu(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        if interaction.guild is None or not isinstance(
+            interaction.user, discord.Member
+        ):
+            await interaction.response.send_message(
+                "This control only works inside a server.",
+                ephemeral=True,
+            )
+            return
+
+        row = await bot.get_or_create_stats(
+            interaction.guild.id,
+            interaction.user.id,
+        )
+        level = level_from_total_seconds(row["total_voice_seconds"])
+        unlocks = await bot.get_emoji_unlocks(interaction.guild.id)
+        available = unlocked_emojis(level, unlocks)
+        if not available:
+            await interaction.response.send_message(
+                "You have not unlocked any nickname emojis yet.",
+                ephemeral=True,
+            )
+            return
+
+        raw_selection = str(row["selected_emoji"] or "").strip()
+        current = valid_selected_emoji(raw_selection, level, unlocks)
+        auto_status = "ON" if not raw_selection else "OFF"
+        embed = discord.Embed(
+            title="Choose Your Nickname Emoji",
+            description=(
+                f"Your level: **{level}**\n"
+                f"Current badge: **{current or 'None'}**\n"
+                f"Automatic emoji changes: **{auto_status}**\n\n"
+                "Choosing an emoji turns automatic changes **OFF** and keeps "
+                "that badge selected."
+            ),
+            color=discord.Color.blurple(),
+        )
+        await interaction.response.send_message(
+            embed=embed,
+            view=EmojiChoiceView(
+                interaction.guild.id,
+                interaction.user.id,
+                available,
+                raw_selection,
+            ),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Toggle Auto Emoji",
+        style=discord.ButtonStyle.secondary,
+        emoji="🔄",
+        custom_id="voicelevels:emoji_panel:auto",
+    )
+    async def toggle_auto_emoji(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        if interaction.guild is None or not isinstance(
+            interaction.user, discord.Member
+        ):
+            await interaction.response.send_message(
+                "This control only works inside a server.",
+                ephemeral=True,
+            )
+            return
+
+        row = await bot.get_or_create_stats(
+            interaction.guild.id,
+            interaction.user.id,
+        )
+        level = level_from_total_seconds(row["total_voice_seconds"])
+        unlocks = await bot.get_emoji_unlocks(interaction.guild.id)
+        raw_selection = str(row["selected_emoji"] or "").strip()
+
+        if not raw_selection:
+            # Auto is currently on. Freeze the badge currently being displayed.
+            current_badge = valid_selected_emoji("", level, unlocks)
+            if not current_badge:
+                await interaction.response.send_message(
+                    "You need to unlock an emoji before automatic changes can be turned off.",
+                    ephemeral=True,
+                )
+                return
+            new_selection = current_badge
+            auto_enabled = False
+        else:
+            # Any explicit selection (including the old no-badge sentinel) means
+            # auto is off. Clearing it restores highest-unlocked automatic mode.
+            new_selection = ""
+            auto_enabled = True
+
+        await interaction.response.defer(ephemeral=True)
+        await bot.pool.execute(
+            "UPDATE voice_levels SET selected_emoji = $1 "
+            "WHERE guild_id = $2 AND user_id = $3;",
+            new_selection,
+            interaction.guild.id,
+            interaction.user.id,
+        )
+        result = await bot.apply_level_nickname(
+            interaction.user,
+            level,
+            new_selection,
+        )
+        if result in {"updated", "unchanged"}:
+            await bot.mark_nickname_synced(
+                interaction.guild.id,
+                interaction.user.id,
+                level,
+            )
+
+        if auto_enabled:
+            badge = valid_selected_emoji("", level, unlocks)
+            message = (
+                "🔄 Automatic emoji changes are now **ON**. "
+                f"Your highest unlocked badge ({badge or 'None'}) will be used, "
+                "and it will update when you reach new emoji levels."
+            )
+        else:
+            message = (
+                "⏸️ Automatic emoji changes are now **OFF**. "
+                f"Your current badge ({new_selection}) will stay selected."
+            )
+
+        if result not in {"updated", "unchanged"}:
+            message += (
+                "\nYour setting was saved, but I could not update your nickname "
+                "because of Discord role or nickname permissions."
+            )
+        await interaction.followup.send(message, ephemeral=True)
+
+
 class EmojiBulkEditModal(discord.ui.Modal):
     """Private popup used to replace every emoji unlock in one paste."""
 
@@ -1839,6 +2104,35 @@ async def configured_emoji_autocomplete(
             continue
         choices.append(app_commands.Choice(name=label[:100], value=emoji))
     return choices[:25]
+
+
+@emoji_admin_group.command(
+    name="panel",
+    description="Post the public nickname emoji control panel.",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def emoji_admin_panel(interaction: discord.Interaction) -> None:
+    assert interaction.guild is not None
+    embed = discord.Embed(
+        title="Nickname Emoji Control Panel",
+        description=(
+            "Use the buttons below to manage the emoji shown before your nickname.\n\n"
+            "🎨 **Change Emoji** — privately choose from badges you have unlocked.\n"
+            "🔄 **Toggle Auto Emoji** — turn automatic highest-unlocked badge "
+            "changes off or back on.\n\n"
+            "The panel is public, but your menu and confirmations are private."
+        ),
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(
+        text="Only members with Manage Server can post this panel."
+    )
+    await interaction.response.send_message(
+        embed=embed,
+        view=EmojiControlPanelView(),
+    )
 
 
 @emoji_admin_group.command(
