@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 
 if not hasattr(discord.ui, "LayoutView"):
     raise RuntimeError(
-        "The inline Nickname Studio requires discord.py 2.6 or newer. "
+        "The inline Nickname Panel requires discord.py 2.6 or newer. "
         "Update your dependency to discord.py>=2.6."
     )
 
@@ -1902,7 +1902,7 @@ class EmojiChoiceView(discord.ui.View):
 
 
 class NicknamePanelButton(discord.ui.Button):
-    """Button accessory displayed beside one Nickname Studio section."""
+    """Button accessory displayed beside one Nickname Panel section."""
 
     def __init__(
         self,
@@ -1945,7 +1945,7 @@ class NicknamePanelButton(discord.ui.Button):
 
 
 class EmojiControlPanelView(discord.ui.LayoutView):
-    """Persistent Components V2 Nickname Studio with inline section buttons."""
+    """Persistent Components V2 Nickname Panel with inline section buttons."""
 
     def __init__(
         self,
@@ -1982,7 +1982,7 @@ class EmojiControlPanelView(discord.ui.LayoutView):
 
         header_text = (
             f"### ✦ {guild_name} · MEMBER CUSTOMIZATION\n"
-            "# NICKNAME STUDIO\n"
+            "# NICKNAME PANEL\n"
             "Build a nickname style that grows with your voice level. "
             "Every action opens privately for you."
         )
@@ -1992,7 +1992,7 @@ class EmojiControlPanelView(discord.ui.LayoutView):
                     header_text,
                     accessory=discord.ui.Thumbnail(
                         thumbnail_url,
-                        description="Nickname Studio",
+                        description="Nickname Panel",
                     ),
                 )
             )
@@ -2052,7 +2052,7 @@ class EmojiControlPanelView(discord.ui.LayoutView):
         )
         panel.add_item(
             discord.ui.TextDisplay(
-                "-# Public studio · Private actions · Only admins can post a new panel"
+                "-# Public panel · Private actions · Only admins can post a new panel"
             )
         )
         self.add_item(panel)
@@ -2367,7 +2367,7 @@ async def configured_emoji_autocomplete(
 
 @emoji_admin_group.command(
     name="panel",
-    description="Post the public Nickname Studio control panel.",
+    description="Post the public Nickname Panel control panel.",
 )
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_guild=True)
