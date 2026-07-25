@@ -695,65 +695,6 @@ class VoiceLevelBot(commands.Bot):
             self.invalidate_emoji_unlocks(guild_id)
         return removed
 
-    async def replace_emoji_unlock(
-        self,
-        guild_id: int,
-        old_emoji: str,
-        new_emoji: str,
-        required_level: int,
-    ) -> tuple[bool, str]:
-        old_emoji = old_emoji.strip()
-        new_emoji = validate_display_emoji(new_emoji)
-        if required_level < 0:
-            raise ValueError("The required level cannot be negative.")
-
-        exists = await self.pool.fetchval(
-            "SELECT 1 FROM emoji_unlocks WHERE guild_id = $1 AND emoji = $2;",
-            guild_id,
-            old_emoji,
-        )
-        if not exists:
-            return False, ""
-
-        async with self.pool.acquire() as connection:
-            async with connection.transaction():
-                await connection.execute(
-                    "DELETE FROM emoji_unlocks WHERE guild_id = $1 AND emoji = $2;",
-                    guild_id,
-                    old_emoji,
-                )
-                await connection.execute(
-                    """
-                    INSERT INTO emoji_unlocks (
-                        guild_id,
-                        emoji,
-                        nickname_badge,
-                        required_level
-                    )
-                    VALUES ($1, $2, $2, $3)
-                    ON CONFLICT (guild_id, emoji)
-                    DO UPDATE SET
-                        nickname_badge = EXCLUDED.emoji,
-                        required_level = EXCLUDED.required_level;
-                    """,
-                    guild_id,
-                    new_emoji,
-                    required_level,
-                )
-                await connection.execute(
-                    """
-                    UPDATE voice_levels
-                    SET selected_emoji = $1
-                    WHERE guild_id = $2 AND selected_emoji = $3;
-                    """,
-                    new_emoji,
-                    guild_id,
-                    old_emoji,
-                )
-
-        self.invalidate_emoji_unlocks(guild_id)
-        return True, new_emoji
-
     async def reset_emoji_unlocks(self, guild_id: int) -> None:
         default_emojis = [emoji for _, emoji in DEFAULT_PARSED_EMOJI_UNLOCKS]
         async with self.pool.acquire() as connection:
@@ -1959,54 +1900,6 @@ async def emoji_admin_set(
 
 
 @emoji_admin_group.command(
-    name="replace",
-    description="Replace an old Unicode emoji while preserving selections.",
-)
-@app_commands.guild_only()
-@app_commands.default_permissions(manage_guild=True)
-@app_commands.checks.has_permissions(manage_guild=True)
-@app_commands.describe(
-    old_emoji="The currently configured Unicode emoji",
-    new_emoji="The new Unicode emoji",
-    level="The new required level",
-)
-@app_commands.autocomplete(old_emoji=configured_emoji_autocomplete)
-async def emoji_admin_replace(
-    interaction: discord.Interaction,
-    old_emoji: str,
-    new_emoji: str,
-    level: app_commands.Range[int, 0, 100000],
-) -> None:
-    assert interaction.guild is not None
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    try:
-        changed, _saved_badge = await bot.replace_emoji_unlock(
-            interaction.guild.id,
-            old_emoji,
-            new_emoji,
-            int(level),
-        )
-    except ValueError as exc:
-        await interaction.followup.send(str(exc), ephemeral=True)
-        return
-
-    if not changed:
-        await interaction.followup.send(
-            "That old emoji is not configured. Use `/emojiadmin list`.",
-            ephemeral=True,
-        )
-        return
-
-    updated, unchanged, skipped = await bot.sync_guild_nicknames(interaction.guild)
-    await interaction.followup.send(
-        f"Replaced {old_emoji} with {new_emoji} at **Level {level}**.\n"
-        f"Nicknames updated: **{updated}**, already correct: **{unchanged}**, "
-        f"skipped: **{skipped}**.",
-        ephemeral=True,
-    )
-
-
-@emoji_admin_group.command(
     name="remove",
     description="Remove an emoji unlock from this server.",
 )
@@ -2024,7 +1917,7 @@ async def emoji_admin_remove(
     unlocks = await bot.get_emoji_unlocks(interaction.guild.id)
     if len(unlocks) <= 1:
         await interaction.followup.send(
-            "You must keep at least one configured emoji. Use `/emojiadmin replace` "
+            "You must keep at least one configured emoji. Use `/emojiadmin editall` "
             "to change the final emoji instead.",
             ephemeral=True,
         )
