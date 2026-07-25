@@ -743,12 +743,12 @@ class VoiceLevelBot(commands.Bot):
         self,
         guild_id: int,
         unlocks: tuple[tuple[int, str], ...],
-    ) -> None:
-        """Atomically replace every configured emoji unlock for one server."""
+    ) -> int:
+        """Replace the schedule and force every member to recalculate their badge."""
         if not unlocks:
             raise ValueError("The emoji list must contain at least one entry.")
 
-        emojis = [emoji for _required_level, emoji in unlocks]
+        reset_count = 0
         async with self.pool.acquire() as connection:
             async with connection.transaction():
                 await connection.execute(
@@ -770,23 +770,26 @@ class VoiceLevelBot(commands.Bot):
                         for required_level, emoji in unlocks
                     ],
                 )
-                # Keep equipped emojis that still exist. Clear removed emojis, while
-                # preserving a deliberate no-badge selection.
-                await connection.execute(
+
+                # A bulk level/emoji schedule edit must take effect for everyone.
+                # Clear pinned/no-badge choices and mark nicknames unsynced so each
+                # member is recalculated from their current voice level.
+                status = await connection.execute(
                     """
                     UPDATE voice_levels
-                    SET selected_emoji = ''
-                    WHERE guild_id = $1
-                      AND selected_emoji <> ''
-                      AND selected_emoji <> $2
-                      AND NOT (selected_emoji = ANY($3::TEXT[]));
+                    SET selected_emoji = '',
+                        nickname_level = -1
+                    WHERE guild_id = $1;
                     """,
                     guild_id,
-                    NO_EMOJI_SELECTION,
-                    emojis,
                 )
+                try:
+                    reset_count = int(status.rsplit(" ", 1)[-1])
+                except (TypeError, ValueError):
+                    reset_count = 0
 
         self.invalidate_emoji_unlocks(guild_id)
+        return reset_count
 
     async def get_or_create_stats(
         self,
@@ -1544,122 +1547,6 @@ async def sync_all_nicknames(interaction: discord.Interaction) -> None:
         "highest role is equal to or above this bot's role.",
         ephemeral=True,
     )
-
-
-@bot.tree.command(
-    name="cleanroles",
-    description="Give the Admin, VIP, and Member list categories a clean dark style.",
-)
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-@app_commands.checks.has_permissions(administrator=True)
-async def clean_roles(interaction: discord.Interaction) -> None:
-    """Rename and hoist the main member-list roles without changing permissions."""
-    assert interaction.guild is not None
-    guild = interaction.guild
-    me = guild.me
-
-    if me is None or not me.guild_permissions.manage_roles:
-        await interaction.response.send_message(
-            "I need the **Manage Roles** permission to style the member list.",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.defer(ephemeral=True, thinking=True)
-
-    # Ignore punctuation, emoji, spaces, and decorative lines while locating roles.
-    def role_key(name: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "", name.casefold())
-
-    style_targets: tuple[tuple[str, set[str], str], ...] = (
-        (
-            "Admin",
-            {"admin", "administrator", "administration"},
-            "━━ ADMIN ━━",
-        ),
-        (
-            "VIP",
-            {"vip", "vipmember", "vipmembers"},
-            "━━ VIP ━━",
-        ),
-        (
-            "Member",
-            {"member", "members", "community"},
-            "━━ MEMBERS ━━",
-        ),
-    )
-
-    updated: list[str] = []
-    unchanged: list[str] = []
-    missing: list[str] = []
-    skipped: list[str] = []
-
-    for label, aliases, styled_name in style_targets:
-        matching_roles = [
-            role
-            for role in guild.roles
-            if not role.is_default()
-            and not role.managed
-            and role_key(role.name) in aliases
-        ]
-
-        if not matching_roles:
-            missing.append(label)
-            continue
-
-        role = max(matching_roles, key=lambda candidate: candidate.position)
-
-        if role >= me.top_role:
-            skipped.append(f"{role.name} (move the bot's role above it)")
-            continue
-
-        if role.name == styled_name and role.hoist:
-            unchanged.append(styled_name)
-            continue
-
-        try:
-            await role.edit(
-                name=styled_name,
-                hoist=True,
-                reason=(
-                    f"Clean dark member-list style requested by "
-                    f"{interaction.user} ({interaction.user.id})"
-                ),
-            )
-            updated.append(styled_name)
-        except discord.Forbidden:
-            skipped.append(f"{role.name} (missing permission or role hierarchy)")
-        except discord.HTTPException:
-            log.exception(
-                "Discord rejected clean role styling for role %s in guild %s",
-                role.id,
-                guild.id,
-            )
-            skipped.append(f"{role.name} (Discord rejected the update)")
-
-    lines = ["**Clean dark member-list style finished.**"]
-    if updated:
-        lines.append("Updated: " + ", ".join(f"`{name}`" for name in updated))
-    if unchanged:
-        lines.append(
-            "Already styled: " + ", ".join(f"`{name}`" for name in unchanged)
-        )
-    if missing:
-        lines.append(
-            "Not found: "
-            + ", ".join(f"**{name}**" for name in missing)
-            + " — create or rename those roles, then run the command again."
-        )
-    if skipped:
-        lines.append("Skipped: " + "; ".join(skipped))
-
-    lines.append(
-        "\nDiscord controls the **Online** and **Offline** headings, so those "
-        "cannot be renamed. Existing role colors and permissions were preserved."
-    )
-
-    await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
 emoji_group = app_commands.Group(
@@ -2447,12 +2334,31 @@ class EmojiBulkEditModal(discord.ui.Modal):
             return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await bot.replace_all_emoji_unlocks(interaction.guild.id, unlocks)
+
+        # Fetch offline members before mass syncing when Discord has not fully
+        # populated the guild member cache yet.
+        if not interaction.guild.chunked:
+            try:
+                await interaction.guild.chunk(cache=True)
+            except Exception:
+                log.exception(
+                    "Could not fully refresh the member cache before emoji bulk sync "
+                    "for guild %s",
+                    interaction.guild.id,
+                )
+
+        reset_count = await bot.replace_all_emoji_unlocks(
+            interaction.guild.id,
+            unlocks,
+        )
         updated, unchanged, skipped = await bot.sync_guild_nicknames(
             interaction.guild
         )
         await interaction.followup.send(
             f"Saved **{len(unlocks)}** emoji unlock(s) at once.\n"
+            f"Recalculated emoji mode for **{reset_count}** saved member(s). "
+            "Everyone was returned to **Auto Upgrade** so the new level schedule "
+            "could take effect.\n"
             f"Nicknames updated: **{updated}**, already correct: **{unchanged}**, "
             f"skipped: **{skipped}**.",
             ephemeral=True,
