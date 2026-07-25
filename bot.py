@@ -545,8 +545,13 @@ class VoiceLevelBot(commands.Bot):
     async def get_emoji_unlocks(
         self,
         guild_id: int,
+        *,
+        force_refresh: bool = False,
     ) -> tuple[EmojiUnlock, ...]:
-        """Load Unicode unlocks and migrate old custom codes once per server."""
+        """Load configured unlocks, optionally bypassing the in-memory cache."""
+        if force_refresh:
+            self.invalidate_emoji_unlocks(guild_id)
+
         cached = self._emoji_unlock_cache.get(guild_id)
         if cached is not None:
             return cached
@@ -788,7 +793,12 @@ class VoiceLevelBot(commands.Bot):
                 except (TypeError, ValueError):
                     reset_count = 0
 
-        self.invalidate_emoji_unlocks(guild_id)
+        # Immediately publish the newly pasted schedule to every command that
+        # reads from the cache. List commands still force a database refresh.
+        self._emoji_unlock_cache[guild_id] = tuple(
+            (required_level, emoji, emoji)
+            for required_level, emoji in unlocks
+        )
         return reset_count
 
     async def get_or_create_stats(
@@ -1363,7 +1373,11 @@ async def rank(
     total = int(row["total_voice_seconds"])
     level, progress, required = progress_for_total(total)
     remaining = max(0, required - progress)
-    unlocks = await bot.get_emoji_unlocks(interaction.guild.id)
+    # Always read the database so /emojiadmin editall changes appear immediately.
+    unlocks = await bot.get_emoji_unlocks(
+        interaction.guild.id,
+        force_refresh=True,
+    )
     selected_emoji = valid_selected_emoji(row["selected_emoji"], level, unlocks)
 
     # Reapply the nickname whenever rank is checked so the displayed level stays current.
@@ -2351,16 +2365,41 @@ class EmojiBulkEditModal(discord.ui.Modal):
             interaction.guild.id,
             unlocks,
         )
+
+        # Verify the saved database schedule before updating nicknames and replying.
+        saved_unlocks = await bot.get_emoji_unlocks(
+            interaction.guild.id,
+            force_refresh=True,
+        )
+        expected_unlocks = tuple(
+            (required_level, emoji, emoji)
+            for required_level, emoji in unlocks
+        )
+        if saved_unlocks != expected_unlocks:
+            log.error(
+                "Emoji bulk-save verification failed for guild %s: expected=%r saved=%r",
+                interaction.guild.id,
+                expected_unlocks,
+                saved_unlocks,
+            )
+            await interaction.followup.send(
+                "The emoji schedule could not be verified after saving. "
+                "Nothing else was changed; check the bot logs and try again.",
+                ephemeral=True,
+            )
+            return
+
         updated, unchanged, skipped = await bot.sync_guild_nicknames(
             interaction.guild
         )
         await interaction.followup.send(
-            f"Saved **{len(unlocks)}** emoji unlock(s) at once.\n"
+            f"Saved and verified **{len(saved_unlocks)}** emoji unlock(s) at once.\n"
             f"Recalculated emoji mode for **{reset_count}** saved member(s). "
             "Everyone was returned to **Auto Upgrade** so the new level schedule "
             "could take effect.\n"
             f"Nicknames updated: **{updated}**, already correct: **{unchanged}**, "
-            f"skipped: **{skipped}**.",
+            f"skipped: **{skipped}**.\n"
+            "Both `/emoji list` and `/emojiadmin list` now use this exact saved schedule.",
             ephemeral=True,
         )
 
@@ -2516,7 +2555,11 @@ async def emoji_admin_remove(
 async def emoji_admin_list(interaction: discord.Interaction) -> None:
     """This is the only /emojiadmin subcommand available to every member."""
     assert interaction.guild is not None
-    unlocks = await bot.get_emoji_unlocks(interaction.guild.id)
+    # Always read the database so the admin list exactly matches editall.
+    unlocks = await bot.get_emoji_unlocks(
+        interaction.guild.id,
+        force_refresh=True,
+    )
     lines: list[str] = []
     for required_level, emoji, _nickname_badge in unlocks:
         lines.append(f"{emoji} — Level **{required_level}**")
