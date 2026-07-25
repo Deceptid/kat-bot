@@ -2551,6 +2551,8 @@ bot.tree.add_command(emoji_admin_group)
     description="Check voice tracking, database, and nickname permissions.",
 )
 @app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(manage_guild=True)
 async def level_status(interaction: discord.Interaction) -> None:
     assert interaction.guild is not None
     await interaction.response.defer(ephemeral=True, thinking=True)
