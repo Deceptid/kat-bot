@@ -1783,12 +1783,17 @@ class EmojiChoiceSelect(discord.ui.Select):
             discord.SelectOption(
                 label=f"{emoji}  Level {required_level}",
                 value=emoji,
+                description=(
+                    "Currently displayed on your nickname"
+                    if selected_emoji == emoji
+                    else "Lock this badge to your nickname"
+                ),
                 default=(selected_emoji == emoji),
             )
             for required_level, emoji, _nickname_badge in visible_unlocks
         ]
         super().__init__(
-            placeholder="Choose an unlocked nickname emoji",
+            placeholder="💠 Select a badge from your vault",
             min_values=1,
             max_values=1,
             options=options,
@@ -1843,19 +1848,35 @@ class EmojiChoiceSelect(discord.ui.Select):
         )
         if result in {"updated", "unchanged"}:
             await bot.mark_nickname_synced(self.guild_id, self.user_id, level)
-            message = (
-                f"Equipped {badge}. **Automatic emoji changes are now OFF**, "
-                "so this badge will stay selected until you change it or turn auto back on."
+            embed = discord.Embed(
+                title="✦ Badge Locked In",
+                description=(
+                    f"{badge} is now your selected nickname badge.\n"
+                    "It will stay equipped until you choose another badge or turn "
+                    "**Auto Upgrade** back on."
+                ),
+                color=discord.Color.from_rgb(63, 196, 126),
+            )
+            embed.add_field(name="Auto Upgrade", value="⏸️ **OFF**", inline=True)
+            embed.add_field(
+                name="Updated Nickname",
+                value=f"`{nickname_with_level(interaction.user, level, badge, unlocks)}`",
+                inline=False,
             )
         else:
-            message = (
-                f"Saved {badge}, but I could not edit your nickname. Make sure the bot "
-                "has **Manage Nicknames** and its role is above your highest role."
+            embed = discord.Embed(
+                title="Badge Saved — Nickname Not Updated",
+                description=(
+                    f"Your {badge} selection was saved, but Discord blocked the nickname "
+                    "change. Give the bot **Manage Nicknames** and place its role above "
+                    "your highest role."
+                ),
+                color=discord.Color.orange(),
             )
 
         await interaction.edit_original_response(
-            content=message,
-            embed=None,
+            content=None,
+            embed=embed,
             view=None,
         )
 
@@ -1875,15 +1896,16 @@ class EmojiChoiceView(discord.ui.View):
 
 
 class EmojiControlPanelView(discord.ui.View):
-    """Persistent public panel; member actions respond privately."""
+    """Persistent public Nickname Studio; member actions respond privately."""
 
     def __init__(self) -> None:
         super().__init__(timeout=None)
 
     @discord.ui.button(
-        label="Change Emoji",
-        style=discord.ButtonStyle.primary,
-        emoji="🎨",
+        label="Open Badge Vault",
+        style=discord.ButtonStyle.success,
+        emoji="💠",
+        row=0,
         custom_id="voicelevels:emoji_panel:open",
     )
     async def open_emoji_menu(
@@ -1909,24 +1931,36 @@ class EmojiControlPanelView(discord.ui.View):
         available = unlocked_emojis(level, unlocks)
         if not available:
             await interaction.response.send_message(
-                "You have not unlocked any nickname emojis yet.",
+                "You have not unlocked any nickname badges yet.",
                 ephemeral=True,
             )
             return
 
         raw_selection = str(row["selected_emoji"] or "").strip()
         current = valid_selected_emoji(raw_selection, level, unlocks)
-        auto_status = "ON" if not raw_selection else "OFF"
+        auto_enabled = not raw_selection
         embed = discord.Embed(
-            title="Choose Your Nickname Emoji",
+            title="💠 Your Badge Vault",
             description=(
-                f"Your level: **{level}**\n"
-                f"Current badge: **{current or 'None'}**\n"
-                f"Automatic emoji changes: **{auto_status}**\n\n"
-                "Choosing an emoji turns automatic changes **OFF** and keeps "
-                "that badge selected."
+                "Choose any badge you have earned and lock it beside your name.\n"
+                "Selecting a badge pauses **Auto Upgrade** so your choice stays equipped."
             ),
-            color=discord.Color.blurple(),
+            color=discord.Color.from_rgb(118, 82, 255),
+        )
+        embed.add_field(name="Voice Level", value=f"**{level}**", inline=True)
+        embed.add_field(
+            name="Displayed Badge",
+            value=f"**{current or 'None'}**",
+            inline=True,
+        )
+        embed.add_field(
+            name="Auto Upgrade",
+            value="⚡ **ON**" if auto_enabled else "⏸️ **OFF**",
+            inline=True,
+        )
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        embed.set_footer(
+            text=f"{len(available)} badge(s) unlocked • This menu is private"
         )
         await interaction.response.send_message(
             embed=embed,
@@ -1934,15 +1968,16 @@ class EmojiControlPanelView(discord.ui.View):
                 interaction.guild.id,
                 interaction.user.id,
                 available,
-                raw_selection,
+                current,
             ),
             ephemeral=True,
         )
 
     @discord.ui.button(
-        label="Toggle Auto Emoji",
-        style=discord.ButtonStyle.secondary,
-        emoji="🔄",
+        label="Toggle Auto Upgrade",
+        style=discord.ButtonStyle.primary,
+        emoji="⚡",
+        row=0,
         custom_id="voicelevels:emoji_panel:auto",
     )
     async def toggle_auto_emoji(
@@ -1972,15 +2007,15 @@ class EmojiControlPanelView(discord.ui.View):
             current_badge = valid_selected_emoji("", level, unlocks)
             if not current_badge:
                 await interaction.response.send_message(
-                    "You need to unlock an emoji before automatic changes can be turned off.",
+                    "You need to unlock a badge before Auto Upgrade can be paused.",
                     ephemeral=True,
                 )
                 return
             new_selection = current_badge
             auto_enabled = False
         else:
-            # Any explicit selection (including the old no-badge sentinel) means
-            # auto is off. Clearing it restores highest-unlocked automatic mode.
+            # Any explicit selection (including no badge) means auto is paused.
+            # Clearing the value restores highest-unlocked automatic mode.
             new_selection = ""
             auto_enabled = True
 
@@ -2004,25 +2039,129 @@ class EmojiControlPanelView(discord.ui.View):
                 level,
             )
 
+        displayed_badge = valid_selected_emoji(new_selection, level, unlocks)
         if auto_enabled:
-            badge = valid_selected_emoji("", level, unlocks)
-            message = (
-                "🔄 Automatic emoji changes are now **ON**. "
-                f"Your highest unlocked badge ({badge or 'None'}) will be used, "
-                "and it will update when you reach new emoji levels."
+            embed = discord.Embed(
+                title="⚡ Auto Upgrade Activated",
+                description=(
+                    "Your nickname will now automatically use your newest unlocked badge "
+                    "whenever you reach a badge level."
+                ),
+                color=discord.Color.from_rgb(88, 145, 255),
+            )
+            embed.add_field(name="Status", value="🟢 **ON**", inline=True)
+            embed.add_field(
+                name="Current Badge",
+                value=f"**{displayed_badge or 'None'}**",
+                inline=True,
             )
         else:
-            message = (
-                "⏸️ Automatic emoji changes are now **OFF**. "
-                f"Your current badge ({new_selection}) will stay selected."
+            embed = discord.Embed(
+                title="⏸️ Auto Upgrade Paused",
+                description=(
+                    f"Your {new_selection} badge is now locked in and will not change "
+                    "when you level up."
+                ),
+                color=discord.Color.from_rgb(255, 184, 77),
+            )
+            embed.add_field(name="Status", value="⏸️ **OFF**", inline=True)
+            embed.add_field(
+                name="Locked Badge",
+                value=f"**{new_selection}**",
+                inline=True,
             )
 
         if result not in {"updated", "unchanged"}:
-            message += (
-                "\nYour setting was saved, but I could not update your nickname "
-                "because of Discord role or nickname permissions."
+            embed.add_field(
+                name="Nickname Update",
+                value=(
+                    "Your setting was saved, but Discord blocked the nickname edit. "
+                    "Check the bot's **Manage Nicknames** permission and role position."
+                ),
+                inline=False,
             )
-        await interaction.followup.send(message, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @discord.ui.button(
+        label="View My Nickname Card",
+        style=discord.ButtonStyle.secondary,
+        emoji="📇",
+        row=1,
+        custom_id="voicelevels:emoji_panel:status",
+    )
+    async def view_nickname_card(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        if interaction.guild is None or not isinstance(
+            interaction.user, discord.Member
+        ):
+            await interaction.response.send_message(
+                "This control only works inside a server.",
+                ephemeral=True,
+            )
+            return
+
+        row = await bot.get_or_create_stats(
+            interaction.guild.id,
+            interaction.user.id,
+        )
+        total_seconds = int(row["total_voice_seconds"])
+        level = level_from_total_seconds(total_seconds)
+        unlocks = await bot.get_emoji_unlocks(interaction.guild.id)
+        raw_selection = str(row["selected_emoji"] or "").strip()
+        current = valid_selected_emoji(raw_selection, level, unlocks)
+        available = unlocked_emojis(level, unlocks)
+        next_unlock = next_emoji_unlock(level, unlocks)
+        auto_enabled = not raw_selection
+
+        if auto_enabled:
+            mode_text = "⚡ Auto Upgrade"
+        elif raw_selection == NO_EMOJI_SELECTION:
+            mode_text = "🚫 No Badge"
+        else:
+            mode_text = "🔒 Badge Locked"
+
+        embed = discord.Embed(
+            title="✦ Your Nickname Card",
+            description=(
+                f"`{nickname_with_level(interaction.user, level, raw_selection, unlocks)}`\n"
+                "A private snapshot of your current nickname setup."
+            ),
+            color=discord.Color.from_rgb(118, 82, 255),
+        )
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        embed.add_field(name="Voice Level", value=f"**{level}**", inline=True)
+        embed.add_field(
+            name="Current Badge",
+            value=f"**{current or 'None'}**",
+            inline=True,
+        )
+        embed.add_field(name="Mode", value=mode_text, inline=True)
+        embed.add_field(
+            name="Unlocked Vault",
+            value=f"**{len(available)}** badge(s)",
+            inline=True,
+        )
+        embed.add_field(
+            name="Voice Time",
+            value=f"**{format_duration(total_seconds)}**",
+            inline=True,
+        )
+        embed.add_field(
+            name="Next Badge",
+            value=(
+                f"{next_unlock[1]} at **Level {next_unlock[0]}**"
+                if next_unlock is not None
+                else "All badges unlocked"
+            ),
+            inline=True,
+        )
+        embed.set_footer(
+            text="Use Badge Vault to lock a badge • Use Auto Upgrade to follow your level"
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 class EmojiBulkEditModal(discord.ui.Modal):
@@ -2108,7 +2247,7 @@ async def configured_emoji_autocomplete(
 
 @emoji_admin_group.command(
     name="panel",
-    description="Post the public nickname emoji control panel.",
+    description="Post the public Nickname Studio control panel.",
 )
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_guild=True)
@@ -2116,18 +2255,52 @@ async def configured_emoji_autocomplete(
 async def emoji_admin_panel(interaction: discord.Interaction) -> None:
     assert interaction.guild is not None
     embed = discord.Embed(
-        title="Nickname Emoji Control Panel",
+        title="✦ NICKNAME STUDIO",
         description=(
-            "Use the buttons below to manage the emoji shown before your nickname.\n\n"
-            "🎨 **Change Emoji** — privately choose from badges you have unlocked.\n"
-            "🔄 **Toggle Auto Emoji** — turn automatic highest-unlocked badge "
-            "changes off or back on.\n\n"
-            "The panel is public, but your menu and confirmations are private."
+            "Build a nickname style that grows with your voice level.\n"
+            "Every button opens a **private** menu made only for you."
         ),
-        color=discord.Color.blurple(),
+        color=discord.Color.from_rgb(118, 82, 255),
     )
+
+    author_name = f"{interaction.guild.name} • Member Customization"
+    if interaction.guild.icon is not None:
+        embed.set_author(name=author_name, icon_url=interaction.guild.icon.url)
+    else:
+        embed.set_author(name=author_name)
+
+    embed.add_field(
+        name="━━  CUSTOMIZE YOUR STYLE  ━━",
+        value=(
+            "💠 **BADGE VAULT**\n"
+            "Browse the emoji badges you have unlocked and lock your favorite "
+            "beside your nickname."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="━━  SMART NICKNAME MODE  ━━",
+        value=(
+            "⚡ **AUTO UPGRADE**\n"
+            "Keep your badge matched to your newest unlock, or pause it to hold "
+            "the badge you like."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="━━  YOUR PROFILE  ━━",
+        value=(
+            "📇 **NICKNAME CARD**\n"
+            "View your level, current badge, voice time, mode, and next unlock "
+            "in one private card."
+        ),
+        inline=False,
+    )
+
+    if interaction.client.user is not None:
+        embed.set_thumbnail(url=interaction.client.user.display_avatar.url)
     embed.set_footer(
-        text="Only members with Manage Server can post this panel."
+        text="Public panel • Private controls • Only admins can post a new panel"
     )
     await interaction.response.send_message(
         embed=embed,
