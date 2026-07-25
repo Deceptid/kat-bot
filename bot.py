@@ -1925,91 +1925,6 @@ async def emoji_admin_edit_all(interaction: discord.Interaction) -> None:
 
 
 @emoji_admin_group.command(
-    name="thread",
-    description="Create an easy-to-find thread for managing every emoji unlock.",
-)
-@app_commands.guild_only()
-@app_commands.default_permissions(manage_guild=True)
-@app_commands.checks.has_permissions(manage_guild=True)
-async def emoji_admin_thread(interaction: discord.Interaction) -> None:
-    assert interaction.guild is not None
-    await interaction.response.defer(ephemeral=True, thinking=True)
-
-    source_channel = interaction.channel
-    thread: discord.Thread | None = None
-
-    if isinstance(source_channel, discord.Thread):
-        thread = source_channel
-    elif isinstance(source_channel, discord.TextChannel):
-        thread = next(
-            (
-                existing
-                for existing in interaction.guild.threads
-                if existing.parent_id == source_channel.id
-                and existing.name.casefold() == "emoji-settings"
-            ),
-            None,
-        )
-
-        if thread is None:
-            try:
-                thread = await source_channel.create_thread(
-                    name="emoji-settings",
-                    type=discord.ChannelType.private_thread,
-                    invitable=False,
-                    reason="Create a private emoji settings workspace",
-                )
-            except (discord.Forbidden, discord.HTTPException):
-                # Public-thread fallback for servers where private-thread creation
-                # is unavailable but public threads are allowed.
-                try:
-                    thread = await source_channel.create_thread(
-                        name="emoji-settings",
-                        type=discord.ChannelType.public_thread,
-                        reason="Create an emoji settings workspace",
-                    )
-                except (discord.Forbidden, discord.HTTPException):
-                    thread = None
-    else:
-        thread = None
-
-    if thread is None:
-        await interaction.followup.send(
-            "I could not create the settings thread here. Run this command in a "
-            "normal text channel and give the bot **Create Public Threads** or "
-            "**Create Private Threads** permission.",
-            ephemeral=True,
-        )
-        return
-
-    try:
-        await thread.add_user(interaction.user)
-    except (discord.Forbidden, discord.HTTPException):
-        pass
-
-    unlocks = await bot.get_emoji_unlocks(interaction.guild.id)
-    current_block = format_emoji_unlock_block(unlocks)
-    embed = discord.Embed(
-        title="Emoji Unlock Settings",
-        description=(
-            "Run `/emojiadmin editall` in this thread. A private popup will open "
-            "with every entry already filled in. Press **Ctrl+A**, paste your full "
-            "replacement list, and submit it.\n\n"
-            "Format: one `level=emoji` entry per line."
-        ),
-        color=discord.Color.blurple(),
-    )
-    await thread.send(
-        content=f"Current copy/paste list:\n```text\n{current_block}\n```",
-        embed=embed,
-    )
-    await interaction.followup.send(
-        f"Emoji settings are ready in {thread.mention}.",
-        ephemeral=True,
-    )
-
-
-@emoji_admin_group.command(
     name="set",
     description="Add a Unicode emoji unlock or change its required level.",
 )
@@ -2151,8 +2066,8 @@ async def emoji_admin_list(interaction: discord.Interaction) -> None:
     )
     embed.set_footer(
         text=(
-            "Everyone can use this list. Managers can use /emojiadmin thread "
-            "and /emojiadmin editall to replace everything with one paste."
+            "Everyone can use this list. Managers can use /emojiadmin editall "
+            "to replace everything with one paste."
         )
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
