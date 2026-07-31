@@ -543,7 +543,7 @@ def footer_guild_id(embed: discord.Embed) -> int | None:
 
 
 class NotifyMeButton(discord.ui.Button):
-    """Persistent green button that keeps Kat game alerts enabled."""
+    """Subscribe the clicking member to future Kat game alerts."""
 
     def __init__(self, bot: "KatBot") -> None:
         super().__init__(
@@ -555,18 +555,67 @@ class NotifyMeButton(discord.ui.Button):
         self.bot = bot
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        if interaction.message is None or not interaction.message.embeds:
+        guild = interaction.guild
+        guild_id = guild.id if guild is not None else None
+
+        # DM copies do not have interaction.guild, so recover the server ID from
+        # the alert footer and then locate the member in Kat's cache.
+        if guild_id is None and interaction.message is not None and interaction.message.embeds:
+            guild_id = footer_guild_id(interaction.message.embeds[0])
+            if guild_id is not None:
+                guild = self.bot.get_guild(guild_id)
+
+        if guild is None or guild_id is None:
             await interaction.response.send_message(
                 "I could not identify which server this alert came from."
             )
             return
 
-        guild_id = footer_guild_id(interaction.message.embeds[0])
-        if guild_id is None:
+        role = guild.get_role(PING_ROLE_ID)
+        member = guild.get_member(interaction.user.id)
+        if role is None or member is None:
             await interaction.response.send_message(
-                "I could not identify which server this alert came from."
+                "Kat could not find the alert role or your server membership.",
+                ephemeral=interaction.guild is not None,
             )
             return
+
+        if role not in member.roles:
+            me = guild.me
+            if (
+                me is None
+                or not me.guild_permissions.manage_roles
+                or role >= me.top_role
+            ):
+                await interaction.response.send_message(
+                    "Kat needs **Manage Roles**, and Kat's role must be above the "
+                    f"**{role.name}** role before this button can subscribe you.",
+                    ephemeral=interaction.guild is not None,
+                )
+                return
+
+            try:
+                await member.add_roles(
+                    role,
+                    reason="Member clicked Notify Me Next Time on a Kat game alert",
+                )
+            except discord.Forbidden:
+                await interaction.response.send_message(
+                    "Kat could not add the alert role because of Discord role hierarchy.",
+                    ephemeral=interaction.guild is not None,
+                )
+                return
+            except discord.HTTPException:
+                log.exception(
+                    "Discord rejected alert-role assignment for user %s in guild %s",
+                    member.id,
+                    guild.id,
+                )
+                await interaction.response.send_message(
+                    "Discord rejected the role update. Please try again shortly.",
+                    ephemeral=interaction.guild is not None,
+                )
+                return
 
         await self.bot.pool.execute(
             "DELETE FROM katping_opt_outs WHERE guild_id = $1 AND user_id = $2;",
@@ -574,59 +623,19 @@ class NotifyMeButton(discord.ui.Button):
             interaction.user.id,
         )
         await interaction.response.send_message(
-            "🔔 You will keep receiving Kat game alerts from this server."
-        )
-
-
-class MuteAlertsButton(discord.ui.Button):
-    """Persistent button that disables future Kat game alerts for a server."""
-
-    def __init__(self, bot: "KatBot") -> None:
-        super().__init__(
-            label="Mute Alerts",
-            style=discord.ButtonStyle.secondary,
-            emoji="🔕",
-            custom_id="katping:mute_alerts",
-        )
-        self.bot = bot
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        if interaction.message is None or not interaction.message.embeds:
-            await interaction.response.send_message(
-                "I could not identify which server this alert came from."
-            )
-            return
-
-        guild_id = footer_guild_id(interaction.message.embeds[0])
-        if guild_id is None:
-            await interaction.response.send_message(
-                "I could not identify which server this alert came from."
-            )
-            return
-
-        await self.bot.pool.execute(
-            """
-            INSERT INTO katping_opt_outs (guild_id, user_id)
-            VALUES ($1, $2)
-            ON CONFLICT (guild_id, user_id) DO NOTHING;
-            """,
-            guild_id,
-            interaction.user.id,
-        )
-        await interaction.response.send_message(
-            "🔕 Kat game alerts from this server are now muted."
+            f"🔔 You will be notified the next time someone starts a game in **{guild.name}**.",
+            ephemeral=interaction.guild is not None,
         )
 
 
 class AlertToggleView(discord.ui.View):
-    """Game-alert buttons shown under each Kat DM."""
+    """Public and DM game-alert buttons: Join VC and Notify Me Next Time."""
 
     def __init__(
         self,
         bot: "KatBot",
         *,
         voice_url: str | None = None,
-        lfg_url: str | None = None,
     ) -> None:
         super().__init__(timeout=None)
         self.bot = bot
@@ -640,18 +649,8 @@ class AlertToggleView(discord.ui.View):
                     url=voice_url,
                 )
             )
-        elif lfg_url:
-            self.add_item(
-                discord.ui.Button(
-                    label="Open LFG",
-                    style=discord.ButtonStyle.link,
-                    emoji="🎮",
-                    url=lfg_url,
-                )
-            )
 
         self.add_item(NotifyMeButton(bot))
-        self.add_item(MuteAlertsButton(bot))
 
 
 class KatBot(commands.Bot):
@@ -1609,44 +1608,19 @@ def build_alert_embed(
     guild: discord.Guild,
     inviter: discord.Member,
     context: LfgContext,
-    voice_channel: discord.VoiceChannel | None,
 ) -> discord.Embed:
+    """Build the compact public game alert shown in the current LFG post."""
     safe_post = discord.utils.escape_markdown(context.post_name)
-    safe_inviter = discord.utils.escape_markdown(inviter.display_name)
-    destination = " in VC" if voice_channel is not None else ""
 
     embed = discord.Embed(
-        title="🎮 Game alert!",
-        url=context.jump_url,
+        title="Game alert!",
         description=(
-            f"**{safe_inviter}** started playing **{safe_post}** and is inviting "
-            f"you to join them{destination}!\n\n"
-            f"**LFG post:** [Open {safe_post}]({context.jump_url})"
+            f"{inviter.mention} started playing **{safe_post}** and is inviting "
+            "you to join them in VC!"
         ),
         color=discord.Color.from_rgb(87, 242, 135),
-        timestamp=datetime.now(timezone.utc),
     )
-    embed.set_author(
-        name=f"{BOT_NAME} • {guild.name}",
-        icon_url=inviter.display_avatar.url,
-    )
-
-    if voice_channel is not None:
-        embed.add_field(
-            name="Voice channel",
-            value=(
-                f"[🔊 {discord.utils.escape_markdown(voice_channel.name)}]"
-                f"(https://discord.com/channels/{guild.id}/{voice_channel.id})"
-            ),
-            inline=True,
-        )
-
-    embed.add_field(
-        name="Started by",
-        value=inviter.mention,
-        inline=True,
-    )
-    embed.set_footer(text=f"Use the buttons below to manage alerts • Guild ID: {guild.id}")
+    embed.set_footer(text=f"{guild.name} • Guild ID: {guild.id}")
     return embed
 
 
@@ -1654,22 +1628,13 @@ async def send_alert(
     member: discord.Member,
     embed: discord.Embed,
     *,
-    context: LfgContext,
-    voice_channel: discord.VoiceChannel | None,
+    voice_url: str,
 ) -> bool:
-    voice_url = (
-        f"https://discord.com/channels/{member.guild.id}/{voice_channel.id}"
-        if voice_channel is not None
-        else None
-    )
+    """Send the same game alert privately to subscribed role members."""
     try:
         await member.send(
             embed=embed,
-            view=AlertToggleView(
-                bot,
-                voice_url=voice_url,
-                lfg_url=context.jump_url,
-            ),
+            view=AlertToggleView(bot, voice_url=voice_url),
         )
         if DM_DELAY_SECONDS:
             await asyncio.sleep(DM_DELAY_SECONDS)
@@ -1683,7 +1648,7 @@ async def send_alert(
 
 @bot.tree.command(
     name="ping",
-    description="DM the LFG alert role using the current post name.",
+    description="Post a public game alert using the current LFG post name.",
 )
 @app_commands.guild_only()
 async def ping_command(interaction: discord.Interaction) -> None:
@@ -1744,13 +1709,39 @@ async def ping_command(interaction: discord.Interaction) -> None:
         )
         return
 
-    # The alert title always comes from the current forum/thread post name.
+    if user.voice is None or not isinstance(user.voice.channel, discord.VoiceChannel):
+        await interaction.response.send_message(
+            "Join the voice channel you want people to enter before using `/ping`. "
+            "Kat needs it to create the **Join VC** button.",
+            ephemeral=True,
+        )
+        return
+
+    voice_channel = user.voice.channel
+    voice_url = f"https://discord.com/channels/{guild.id}/{voice_channel.id}"
     game_name = context.post_name.strip()
+    embed = build_alert_embed(
+        guild=guild,
+        inviter=user,
+        context=context,
+    )
 
-    voice_channel: discord.VoiceChannel | None = None
-    if user.voice is not None and isinstance(user.voice.channel, discord.VoiceChannel):
-        voice_channel = user.voice.channel
+    # This is the main alert. It is posted publicly in the current LFG post so
+    # everyone with access to the post can see and use both buttons.
+    await interaction.response.send_message(
+        content=role.mention,
+        embed=embed,
+        view=AlertToggleView(bot, voice_url=voice_url),
+        allowed_mentions=discord.AllowedMentions(
+            everyone=False,
+            users=True,
+            roles=True,
+            replied_user=False,
+        ),
+    )
 
+    # Keep the original KatPing behavior too: subscribed role members receive a
+    # DM copy, while the public message remains visible to everyone in the post.
     opted_out = await bot.opted_out_user_ids(guild.id)
     role_members: Iterable[discord.Member] = role.members
     recipients = [
@@ -1762,35 +1753,14 @@ async def ping_command(interaction: discord.Interaction) -> None:
     ]
 
     skipped = len(role.members) - len(recipients)
-    if not recipients:
-        await interaction.response.send_message(
-            f"There are no eligible members in **{role.name}** to DM.",
-            ephemeral=True,
-        )
-        return
-
     if len(recipients) > MAX_RECIPIENTS:
         skipped += len(recipients) - MAX_RECIPIENTS
         recipients = recipients[:MAX_RECIPIENTS]
 
-    await interaction.response.defer(ephemeral=True, thinking=True)
-
-    embed = build_alert_embed(
-        guild=guild,
-        inviter=user,
-        context=context,
-        voice_channel=voice_channel,
-    )
-
     delivered = 0
     failed = 0
     for member in recipients:
-        if await send_alert(
-            member,
-            embed,
-            context=context,
-            voice_channel=voice_channel,
-        ):
+        if await send_alert(member, embed, voice_url=voice_url):
             delivered += 1
         else:
             failed += 1
@@ -1807,8 +1777,8 @@ async def ping_command(interaction: discord.Interaction) -> None:
 
     await interaction.followup.send(
         (
-            f"🐱 **{BOT_NAME} alert sent for {game_name}.**\n"
-            f"Delivered: **{delivered}** · Could not DM: **{failed}** · "
+            f"The **{game_name}** alert is now public in this post.\n"
+            f"DMs delivered: **{delivered}** · Could not DM: **{failed}** · "
             f"Skipped: **{skipped}**"
         ),
         ephemeral=True,
