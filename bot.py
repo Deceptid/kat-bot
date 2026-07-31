@@ -15,12 +15,6 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
-if not hasattr(discord.ui, "LayoutView"):
-    raise RuntimeError(
-        "The inline Nickname Panel requires discord.py 2.6 or newer. "
-        "Update your dependency to discord.py>=2.6."
-    )
-
 load_dotenv()
 
 logging.basicConfig(
@@ -43,6 +37,7 @@ LEVEL_UP_CHANNEL_ID = int(os.getenv("LEVEL_UP_CHANNEL_ID", "0") or 0)
 BASE_HOURS = float(os.getenv("BASE_HOURS", "1.0"))
 HOURS_PER_LEVEL = float(os.getenv("HOURS_PER_LEVEL", "0.25"))
 TICK_SECONDS = max(15, int(os.getenv("TICK_SECONDS", "60")))
+SERVER_BOOSTER_XP_MULTIPLIER = 2
 # Use 1 to count a member who is alone in voice. Set this to 2 to require company.
 MIN_HUMANS_IN_VC = max(1, int(os.getenv("MIN_HUMANS_IN_VC", "1")))
 REQUIRE_UNMUTED = env_flag("REQUIRE_UNMUTED", default=False)
@@ -102,31 +97,6 @@ def parse_emoji_unlocks(raw: str) -> tuple[tuple[int, str], ...]:
 
 DEFAULT_PARSED_EMOJI_UNLOCKS = parse_emoji_unlocks(DEFAULT_EMOJI_UNLOCKS)
 
-
-def parse_bulk_emoji_unlocks(raw: str) -> tuple[tuple[int, str], ...]:
-    """Parse a copy/paste block containing one level=emoji entry per line.
-
-    Commas and semicolons are also accepted, so both of these work:
-
-    0=⚪
-    5=⭐
-
-    0=⚪, 5=⭐
-    """
-    normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
-    normalized = re.sub(r"[;\n]+", ",", normalized)
-
-    try:
-        unlocks = parse_emoji_unlocks(normalized)
-    except RuntimeError as exc:
-        message = str(exc).replace("EMOJI_UNLOCKS", "Emoji list")
-        raise ValueError(message) from exc
-
-    if len(unlocks) > 100:
-        raise ValueError("The emoji list can contain at most 100 entries.")
-
-    return unlocks
-
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing.")
 if not DATABASE_URL:
@@ -149,14 +119,6 @@ NO_EMOJI_SELECTION = "__none__"
 
 # (required_level, display_emoji, nickname_badge)
 EmojiUnlock = tuple[int, str, str]
-
-
-def format_emoji_unlock_block(unlocks: Iterable[EmojiUnlock]) -> str:
-    """Return a paste-ready level=emoji block for the bulk editor."""
-    return "\n".join(
-        f"{required_level}={emoji}"
-        for required_level, emoji, _nickname_badge in unlocks
-    )
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS voice_levels (
@@ -215,8 +177,8 @@ CREATE TABLE IF NOT EXISTS bot_migrations (
 UPSERT_ACTIVE_SQL = """
 WITH incoming AS (
     SELECT *
-    FROM UNNEST($1::BIGINT[], $2::BIGINT[])
-         AS t(guild_id, user_id)
+    FROM UNNEST($1::BIGINT[], $2::BIGINT[], $3::BIGINT[])
+         AS t(guild_id, user_id, earned_seconds)
 )
 INSERT INTO voice_levels (
     guild_id,
@@ -226,7 +188,7 @@ INSERT INTO voice_levels (
     nickname_level,
     last_active_at
 )
-SELECT guild_id, user_id, $3, 0, -1, NOW()
+SELECT guild_id, user_id, earned_seconds, 0, -1, NOW()
 FROM incoming
 ON CONFLICT (guild_id, user_id)
 DO UPDATE SET
@@ -476,6 +438,15 @@ def member_is_eligible(member: discord.Member) -> bool:
     return True
 
 
+def member_is_server_booster(member: discord.Member) -> bool:
+    """Return True only while the member currently has Discord's Booster role."""
+    return any(role.is_premium_subscriber() for role in member.roles)
+
+
+def voice_xp_multiplier(member: discord.Member) -> int:
+    return SERVER_BOOSTER_XP_MULTIPLIER if member_is_server_booster(member) else 1
+
+
 class VoiceLevelBot(commands.Bot):
     pool: asyncpg.Pool
 
@@ -517,9 +488,6 @@ class VoiceLevelBot(commands.Bot):
                 )
                 await asyncio.sleep(delay)
 
-        # Register persistent buttons used by public emoji control-panel messages.
-        self.add_view(EmojiControlPanelView())
-
         if TEST_GUILD_ID:
             guild = discord.Object(id=TEST_GUILD_ID)
             self.tree.copy_global_to(guild=guild)
@@ -545,13 +513,8 @@ class VoiceLevelBot(commands.Bot):
     async def get_emoji_unlocks(
         self,
         guild_id: int,
-        *,
-        force_refresh: bool = False,
     ) -> tuple[EmojiUnlock, ...]:
-        """Load configured unlocks, optionally bypassing the in-memory cache."""
-        if force_refresh:
-            self.invalidate_emoji_unlocks(guild_id)
-
+        """Load Unicode unlocks and migrate old custom codes once per server."""
         cached = self._emoji_unlock_cache.get(guild_id)
         if cached is not None:
             return cached
@@ -709,6 +672,65 @@ class VoiceLevelBot(commands.Bot):
             self.invalidate_emoji_unlocks(guild_id)
         return removed
 
+    async def replace_emoji_unlock(
+        self,
+        guild_id: int,
+        old_emoji: str,
+        new_emoji: str,
+        required_level: int,
+    ) -> tuple[bool, str]:
+        old_emoji = old_emoji.strip()
+        new_emoji = validate_display_emoji(new_emoji)
+        if required_level < 0:
+            raise ValueError("The required level cannot be negative.")
+
+        exists = await self.pool.fetchval(
+            "SELECT 1 FROM emoji_unlocks WHERE guild_id = $1 AND emoji = $2;",
+            guild_id,
+            old_emoji,
+        )
+        if not exists:
+            return False, ""
+
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "DELETE FROM emoji_unlocks WHERE guild_id = $1 AND emoji = $2;",
+                    guild_id,
+                    old_emoji,
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO emoji_unlocks (
+                        guild_id,
+                        emoji,
+                        nickname_badge,
+                        required_level
+                    )
+                    VALUES ($1, $2, $2, $3)
+                    ON CONFLICT (guild_id, emoji)
+                    DO UPDATE SET
+                        nickname_badge = EXCLUDED.emoji,
+                        required_level = EXCLUDED.required_level;
+                    """,
+                    guild_id,
+                    new_emoji,
+                    required_level,
+                )
+                await connection.execute(
+                    """
+                    UPDATE voice_levels
+                    SET selected_emoji = $1
+                    WHERE guild_id = $2 AND selected_emoji = $3;
+                    """,
+                    new_emoji,
+                    guild_id,
+                    old_emoji,
+                )
+
+        self.invalidate_emoji_unlocks(guild_id)
+        return True, new_emoji
+
     async def reset_emoji_unlocks(self, guild_id: int) -> None:
         default_emojis = [emoji for _, emoji in DEFAULT_PARSED_EMOJI_UNLOCKS]
         async with self.pool.acquire() as connection:
@@ -743,63 +765,6 @@ class VoiceLevelBot(commands.Bot):
                     default_emojis,
                 )
         self.invalidate_emoji_unlocks(guild_id)
-
-    async def replace_all_emoji_unlocks(
-        self,
-        guild_id: int,
-        unlocks: tuple[tuple[int, str], ...],
-    ) -> int:
-        """Replace the schedule and force every member to recalculate their badge."""
-        if not unlocks:
-            raise ValueError("The emoji list must contain at least one entry.")
-
-        reset_count = 0
-        async with self.pool.acquire() as connection:
-            async with connection.transaction():
-                await connection.execute(
-                    "DELETE FROM emoji_unlocks WHERE guild_id = $1;",
-                    guild_id,
-                )
-                await connection.executemany(
-                    """
-                    INSERT INTO emoji_unlocks (
-                        guild_id,
-                        emoji,
-                        nickname_badge,
-                        required_level
-                    )
-                    VALUES ($1, $2, $2, $3);
-                    """,
-                    [
-                        (guild_id, emoji, required_level)
-                        for required_level, emoji in unlocks
-                    ],
-                )
-
-                # A bulk level/emoji schedule edit must take effect for everyone.
-                # Clear pinned/no-badge choices and mark nicknames unsynced so each
-                # member is recalculated from their current voice level.
-                status = await connection.execute(
-                    """
-                    UPDATE voice_levels
-                    SET selected_emoji = '',
-                        nickname_level = -1
-                    WHERE guild_id = $1;
-                    """,
-                    guild_id,
-                )
-                try:
-                    reset_count = int(status.rsplit(" ", 1)[-1])
-                except (TypeError, ValueError):
-                    reset_count = 0
-
-        # Immediately publish the newly pasted schedule to every command that
-        # reads from the cache. List commands still force a database refresh.
-        self._emoji_unlock_cache[guild_id] = tuple(
-            (required_level, emoji, emoji)
-            for required_level, emoji in unlocks
-        )
-        return reset_count
 
     async def get_or_create_stats(
         self,
@@ -1189,7 +1154,9 @@ class VoiceLevelBot(commands.Bot):
         )
         self._last_tick_monotonic = now
 
-        active_pairs: list[tuple[int, int]] = []
+        # Store a separate earned amount for each member because boosters earn
+        # twice the voice XP during the same real-time tick.
+        active_earnings: dict[tuple[int, int], int] = {}
 
         for guild in self.guilds:
             channels: list[discord.abc.Connectable] = [
@@ -1208,23 +1175,27 @@ class VoiceLevelBot(commands.Bot):
                 if len(eligible_members) < MIN_HUMANS_IN_VC:
                     continue
 
-                active_pairs.extend(
-                    (guild.id, member.id) for member in eligible_members
-                )
+                for member in eligible_members:
+                    earned_seconds = elapsed * voice_xp_multiplier(member)
+                    active_earnings[(guild.id, member.id)] = earned_seconds
 
-        if not active_pairs:
+        if not active_earnings:
             return
 
-        active_pairs = list(dict.fromkeys(active_pairs))
-        guild_ids = [pair[0] for pair in active_pairs]
-        user_ids = [pair[1] for pair in active_pairs]
+        active_entries = [
+            (guild_id, user_id, earned_seconds)
+            for (guild_id, user_id), earned_seconds in active_earnings.items()
+        ]
+        guild_ids = [entry[0] for entry in active_entries]
+        user_ids = [entry[1] for entry in active_entries]
+        earned_seconds = [entry[2] for entry in active_entries]
 
         try:
             rows = await self.pool.fetch(
                 UPSERT_ACTIVE_SQL,
                 guild_ids,
                 user_ids,
-                elapsed,
+                earned_seconds,
             )
             await self.process_level_changes(rows)
         except Exception:
@@ -1373,11 +1344,7 @@ async def rank(
     total = int(row["total_voice_seconds"])
     level, progress, required = progress_for_total(total)
     remaining = max(0, required - progress)
-    # Always read the database so /emojiadmin editall changes appear immediately.
-    unlocks = await bot.get_emoji_unlocks(
-        interaction.guild.id,
-        force_refresh=True,
-    )
+    unlocks = await bot.get_emoji_unlocks(interaction.guild.id)
     selected_emoji = valid_selected_emoji(row["selected_emoji"], level, unlocks)
 
     # Reapply the nickname whenever rank is checked so the displayed level stays current.
@@ -1399,9 +1366,19 @@ async def rank(
         value=f"**{level}**  ·  `{superscript_number(level)}`",
         inline=True,
     )
+    multiplier = voice_xp_multiplier(target)
     embed.add_field(
-        name="Total voice time",
+        name="Voice XP time",
         value=f"**{format_duration(total)}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="XP multiplier",
+        value=(
+            f"🚀 **{multiplier}× Server Booster**"
+            if multiplier > 1
+            else "⚪ **1× Standard**"
+        ),
         inline=True,
     )
     embed.add_field(
@@ -1439,6 +1416,7 @@ async def rank(
     embed.set_footer(
         text=(
             f"Voice counts every {TICK_SECONDS}s · "
+            f"Server Boosters earn {SERVER_BOOSTER_XP_MULTIPLIER}× XP · "
             f"Minimum humans in channel: {MIN_HUMANS_IN_VC}"
         )
     )
@@ -1599,148 +1577,6 @@ async def emoji_badge_autocomplete(
     return choices[:25]
 
 
-def build_emoji_list_embed(
-    *,
-    level: int,
-    unlocks: tuple[EmojiUnlock, ...],
-    selected_emoji: str,
-    page: int,
-) -> tuple[discord.Embed, int]:
-    """Build one of exactly two emoji-list pages."""
-    total_entries = len(unlocks)
-    split_at = max(1, (total_entries + 1) // 2)
-    pages = (
-        unlocks[:split_at],
-        unlocks[split_at:],
-    )
-
-    # Keep the page valid if an admin changes the list while this menu is open.
-    if page == 2 and not pages[1]:
-        page = 1
-
-    page_entries = pages[page - 1]
-    lines: list[str] = []
-    for required_level, emoji, _nickname_badge in page_entries:
-        is_unlocked = level >= required_level
-        status = "✅ Unlocked" if is_unlocked else "🔒 Locked"
-        equipped = " — **EQUIPPED**" if emoji == selected_emoji else ""
-        lines.append(
-            f"{emoji}  ·  Level **{required_level}**  ·  {status}{equipped}"
-        )
-
-    embed = discord.Embed(
-        title="Nickname Emoji Unlocks",
-        description="\n".join(lines) or "*No emoji unlocks on this page.*",
-        color=discord.Color.blurple(),
-    )
-    embed.add_field(name="Your level", value=f"**{level}**", inline=True)
-    embed.add_field(
-        name="Equipped",
-        value=selected_emoji or "None",
-        inline=True,
-    )
-    embed.add_field(
-        name="Showing",
-        value=f"**Page {page} of 2**",
-        inline=True,
-    )
-    embed.set_footer(
-        text=(
-            "Use the buttons below to switch pages · /emoji equip locks a badge · "
-            "/emoji remove hides badges"
-        )
-    )
-    return embed, page
-
-
-class EmojiListPaginationView(discord.ui.View):
-    """Private two-page navigation for /emoji list."""
-
-    def __init__(self, guild_id: int, user_id: int, page: int = 1) -> None:
-        super().__init__(timeout=300)
-        self.guild_id = guild_id
-        self.user_id = user_id
-        self.page = 1 if page != 2 else 2
-        self._update_buttons()
-
-    def _update_buttons(self) -> None:
-        self.page_one.disabled = self.page == 1
-        self.page_two.disabled = self.page == 2
-        self.page_one.style = (
-            discord.ButtonStyle.primary
-            if self.page == 1
-            else discord.ButtonStyle.secondary
-        )
-        self.page_two.style = (
-            discord.ButtonStyle.primary
-            if self.page == 2
-            else discord.ButtonStyle.secondary
-        )
-
-    async def _show_page(
-        self,
-        interaction: discord.Interaction,
-        page: int,
-    ) -> None:
-        if (
-            interaction.guild is None
-            or interaction.guild.id != self.guild_id
-            or interaction.user.id != self.user_id
-            or not isinstance(interaction.user, discord.Member)
-        ):
-            await interaction.response.send_message(
-                "Open `/emoji list` yourself to use these page buttons.",
-                ephemeral=True,
-            )
-            return
-
-        row = await bot.get_or_create_stats(self.guild_id, self.user_id)
-        level = level_from_total_seconds(row["total_voice_seconds"])
-        unlocks = await bot.get_emoji_unlocks(
-            self.guild_id,
-            force_refresh=True,
-        )
-        selected_emoji = valid_selected_emoji(
-            row["selected_emoji"],
-            level,
-            unlocks,
-        )
-
-        embed, resolved_page = build_emoji_list_embed(
-            level=level,
-            unlocks=unlocks,
-            selected_emoji=selected_emoji,
-            page=page,
-        )
-        self.page = resolved_page
-        self._update_buttons()
-        await interaction.response.edit_message(embed=embed, view=self)
-
-    @discord.ui.button(
-        label="Page 1",
-        emoji="◀️",
-        style=discord.ButtonStyle.primary,
-    )
-    async def page_one(
-        self,
-        interaction: discord.Interaction,
-        _button: discord.ui.Button,
-    ) -> None:
-        await self._show_page(interaction, 1)
-
-    @discord.ui.button(
-        label="Page 2",
-        emoji="▶️",
-        style=discord.ButtonStyle.secondary,
-    )
-    async def page_two(
-        self,
-        interaction: discord.Interaction,
-        _button: discord.ui.Button,
-    ) -> None:
-        await self._show_page(interaction, 2)
-
-
 @emoji_group.command(
     name="list",
     description="See nickname emojis and the levels needed to unlock them.",
@@ -1760,31 +1596,36 @@ async def emoji_list(interaction: discord.Interaction) -> None:
         interaction.user.id,
     )
     level = level_from_total_seconds(row["total_voice_seconds"])
-    unlocks = await bot.get_emoji_unlocks(
-        interaction.guild.id,
-        force_refresh=True,
-    )
-    selected_emoji = valid_selected_emoji(
-        row["selected_emoji"],
-        level,
-        unlocks,
-    )
+    unlocks = await bot.get_emoji_unlocks(interaction.guild.id)
+    selected_emoji = valid_selected_emoji(row["selected_emoji"], level, unlocks)
 
-    embed, page = build_emoji_list_embed(
-        level=level,
-        unlocks=unlocks,
-        selected_emoji=selected_emoji,
-        page=1,
+    lines: list[str] = []
+    for required_level, emoji, _nickname_badge in unlocks:
+        unlocked = level >= required_level
+        status = "✅ Unlocked" if unlocked else "🔒 Locked"
+        equipped = " — **equipped**" if emoji == selected_emoji else ""
+        lines.append(
+            f"{emoji} — Level **{required_level}** — {status}{equipped}"
+        )
+
+    embed = discord.Embed(
+        title="Nickname Emoji Unlocks",
+        description="\n".join(lines),
+        color=discord.Color.blurple(),
     )
-    await interaction.response.send_message(
-        embed=embed,
-        view=EmojiListPaginationView(
-            interaction.guild.id,
-            interaction.user.id,
-            page,
-        ),
-        ephemeral=True,
+    embed.add_field(name="Your level", value=f"**{level}**", inline=True)
+    embed.add_field(
+        name="Equipped",
+        value=selected_emoji or "None",
+        inline=True,
     )
+    embed.set_footer(
+        text=(
+            "The highest unlocked badge is used automatically. Use /emoji equip "
+            "to keep a specific badge, or /emoji remove to hide badges."
+        )
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @emoji_group.command(
@@ -1923,624 +1764,6 @@ emoji_admin_group = app_commands.Group(
 )
 
 
-class EmojiChoiceSelect(discord.ui.Select):
-    """Private member-specific dropdown opened from the public control panel."""
-
-    def __init__(
-        self,
-        guild_id: int,
-        user_id: int,
-        unlocks: tuple[EmojiUnlock, ...],
-        selected_emoji: str,
-    ) -> None:
-        self.guild_id = guild_id
-        self.user_id = user_id
-
-        # Discord allows at most 25 select options. Prefer the newest/highest
-        # unlocked badges if a server configured more than that.
-        visible_unlocks = list(unlocks)[-25:]
-        options = [
-            discord.SelectOption(
-                label=f"{emoji}  Level {required_level}",
-                value=emoji,
-                description=(
-                    "Currently displayed on your nickname"
-                    if selected_emoji == emoji
-                    else "Lock this badge to your nickname"
-                ),
-                default=(selected_emoji == emoji),
-            )
-            for required_level, emoji, _nickname_badge in visible_unlocks
-        ]
-        super().__init__(
-            placeholder="💠 Select a badge from your vault",
-            min_values=1,
-            max_values=1,
-            options=options,
-            custom_id="voicelevels:emoji_panel:choice",
-        )
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        if interaction.guild is None or interaction.guild.id != self.guild_id:
-            await interaction.response.send_message(
-                "This emoji menu belongs to a different server.",
-                ephemeral=True,
-            )
-            return
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message(
-                "Open the control panel yourself to change your nickname emoji.",
-                ephemeral=True,
-            )
-            return
-        if not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message(
-                "This control only works inside a server.",
-                ephemeral=True,
-            )
-            return
-
-        badge = self.values[0].strip()
-        row = await bot.get_or_create_stats(self.guild_id, self.user_id)
-        level = level_from_total_seconds(row["total_voice_seconds"])
-        unlocks = await bot.get_emoji_unlocks(self.guild_id)
-        required_level = emoji_required_level(unlocks, badge)
-
-        if required_level is None or level < required_level:
-            await interaction.response.send_message(
-                "That badge is no longer available or has not been unlocked yet.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.defer()
-        await bot.pool.execute(
-            "UPDATE voice_levels SET selected_emoji = $1 "
-            "WHERE guild_id = $2 AND user_id = $3;",
-            badge,
-            self.guild_id,
-            self.user_id,
-        )
-        result = await bot.apply_level_nickname(
-            interaction.user,
-            level,
-            badge,
-        )
-        if result in {"updated", "unchanged"}:
-            await bot.mark_nickname_synced(self.guild_id, self.user_id, level)
-            embed = discord.Embed(
-                title="✦ Badge Locked In",
-                description=(
-                    f"{badge} is now your selected nickname badge.\n"
-                    "It will stay equipped until you choose another badge or turn "
-                    "**Auto Upgrade** back on."
-                ),
-                color=discord.Color.from_rgb(63, 196, 126),
-            )
-            embed.add_field(name="Auto Upgrade", value="⏸️ **OFF**", inline=True)
-            embed.add_field(
-                name="Updated Nickname",
-                value=f"`{nickname_with_level(interaction.user, level, badge, unlocks)}`",
-                inline=False,
-            )
-        else:
-            embed = discord.Embed(
-                title="Badge Saved — Nickname Not Updated",
-                description=(
-                    f"Your {badge} selection was saved, but Discord blocked the nickname "
-                    "change. Give the bot **Manage Nicknames** and place its role above "
-                    "your highest role."
-                ),
-                color=discord.Color.orange(),
-            )
-
-        await interaction.edit_original_response(
-            content=None,
-            embed=embed,
-            view=None,
-        )
-
-
-class EmojiChoiceView(discord.ui.View):
-    def __init__(
-        self,
-        guild_id: int,
-        user_id: int,
-        unlocks: tuple[EmojiUnlock, ...],
-        selected_emoji: str,
-    ) -> None:
-        super().__init__(timeout=180)
-        self.add_item(
-            EmojiChoiceSelect(guild_id, user_id, unlocks, selected_emoji)
-        )
-
-
-class NicknamePanelButton(discord.ui.Button):
-    """Button accessory displayed beside one Nickname Panel section."""
-
-    def __init__(
-        self,
-        *,
-        action: str,
-        label: str,
-        emoji: str,
-        style: discord.ButtonStyle,
-        custom_id: str,
-    ) -> None:
-        super().__init__(
-            label=label,
-            emoji=emoji,
-            style=style,
-            custom_id=custom_id,
-        )
-        self.action = action
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        panel = self.view
-        if not isinstance(panel, EmojiControlPanelView):
-            await interaction.response.send_message(
-                "This control panel is no longer connected correctly. Ask an admin "
-                "to post a new one with `/emojiadmin panel`.",
-                ephemeral=True,
-            )
-            return
-
-        if self.action == "vault":
-            await panel.open_emoji_menu(interaction)
-        elif self.action == "auto":
-            await panel.toggle_auto_emoji(interaction)
-        elif self.action == "card":
-            await panel.view_nickname_card(interaction)
-        else:
-            await interaction.response.send_message(
-                "That panel action is not available.",
-                ephemeral=True,
-            )
-
-
-class EmojiControlPanelView(discord.ui.LayoutView):
-    """Persistent Components V2 Nickname Panel with inline section buttons."""
-
-    def __init__(
-        self,
-        guild_name: str = "YOUR SERVER",
-        thumbnail_url: str | None = None,
-    ) -> None:
-        super().__init__(timeout=None)
-
-        vault_button = NicknamePanelButton(
-            action="vault",
-            label="Open",
-            emoji="💠",
-            style=discord.ButtonStyle.success,
-            custom_id="voicelevels:emoji_panel:open",
-        )
-        auto_button = NicknamePanelButton(
-            action="auto",
-            label="Toggle",
-            emoji="⚡",
-            style=discord.ButtonStyle.primary,
-            custom_id="voicelevels:emoji_panel:auto",
-        )
-        card_button = NicknamePanelButton(
-            action="card",
-            label="View",
-            emoji="📇",
-            style=discord.ButtonStyle.secondary,
-            custom_id="voicelevels:emoji_panel:status",
-        )
-
-        panel = discord.ui.Container(
-            accent_color=discord.Color.from_rgb(118, 82, 255),
-        )
-
-        header_text = (
-            f"### ✦ {guild_name} · MEMBER CUSTOMIZATION\n"
-            "# NICKNAME PANEL\n"
-            "Build a nickname style that grows with your voice level. "
-            "Every action opens privately for you."
-        )
-        if thumbnail_url:
-            panel.add_item(
-                discord.ui.Section(
-                    header_text,
-                    accessory=discord.ui.Thumbnail(
-                        thumbnail_url,
-                        description="Nickname Panel",
-                    ),
-                )
-            )
-        else:
-            panel.add_item(discord.ui.TextDisplay(header_text))
-
-        panel.add_item(
-            discord.ui.Separator(
-                visible=True,
-                spacing=discord.SeparatorSpacing.large,
-            )
-        )
-        panel.add_item(
-            discord.ui.Section(
-                "### 💠 BADGE VAULT",
-                "Browse every emoji badge you have unlocked and lock your favorite "
-                "beside your nickname. Your badge menu is visible only to you.",
-                accessory=vault_button,
-            )
-        )
-
-        panel.add_item(
-            discord.ui.Separator(
-                visible=True,
-                spacing=discord.SeparatorSpacing.large,
-            )
-        )
-        panel.add_item(
-            discord.ui.Section(
-                "### ⚡ AUTO UPGRADE",
-                "Keep your badge matched to your newest unlock, or pause the system "
-                "to hold the badge you like. Press again whenever you want to switch back.",
-                accessory=auto_button,
-            )
-        )
-
-        panel.add_item(
-            discord.ui.Separator(
-                visible=True,
-                spacing=discord.SeparatorSpacing.large,
-            )
-        )
-        panel.add_item(
-            discord.ui.Section(
-                "### 📇 NICKNAME CARD",
-                "View your level, current badge, voice time, nickname mode, unlocked "
-                "badge count, and next reward in one private card.",
-                accessory=card_button,
-            )
-        )
-
-        panel.add_item(
-            discord.ui.Separator(
-                visible=False,
-                spacing=discord.SeparatorSpacing.large,
-            )
-        )
-        panel.add_item(
-            discord.ui.TextDisplay(
-                "-# Public panel · Private actions · Only admins can post a new panel"
-            )
-        )
-        self.add_item(panel)
-
-    async def open_emoji_menu(self, interaction: discord.Interaction) -> None:
-        if interaction.guild is None or not isinstance(
-            interaction.user, discord.Member
-        ):
-            await interaction.response.send_message(
-                "This control only works inside a server.",
-                ephemeral=True,
-            )
-            return
-
-        row = await bot.get_or_create_stats(
-            interaction.guild.id,
-            interaction.user.id,
-        )
-        level = level_from_total_seconds(row["total_voice_seconds"])
-        unlocks = await bot.get_emoji_unlocks(interaction.guild.id)
-        available = unlocked_emojis(level, unlocks)
-        if not available:
-            await interaction.response.send_message(
-                "You have not unlocked any nickname badges yet.",
-                ephemeral=True,
-            )
-            return
-
-        raw_selection = str(row["selected_emoji"] or "").strip()
-        current = valid_selected_emoji(raw_selection, level, unlocks)
-        auto_enabled = not raw_selection
-        embed = discord.Embed(
-            title="💠 Your Badge Vault",
-            description=(
-                "Choose any badge you have earned and lock it beside your name.\n"
-                "Selecting a badge pauses **Auto Upgrade** so your choice stays equipped."
-            ),
-            color=discord.Color.from_rgb(118, 82, 255),
-        )
-        embed.add_field(name="Voice Level", value=f"**{level}**", inline=True)
-        embed.add_field(
-            name="Displayed Badge",
-            value=f"**{current or 'None'}**",
-            inline=True,
-        )
-        embed.add_field(
-            name="Auto Upgrade",
-            value="⚡ **ON**" if auto_enabled else "⏸️ **OFF**",
-            inline=True,
-        )
-        embed.set_thumbnail(url=interaction.user.display_avatar.url)
-        embed.set_footer(
-            text=f"{len(available)} badge(s) unlocked • This menu is private"
-        )
-        await interaction.response.send_message(
-            embed=embed,
-            view=EmojiChoiceView(
-                interaction.guild.id,
-                interaction.user.id,
-                available,
-                current,
-            ),
-            ephemeral=True,
-        )
-
-    async def toggle_auto_emoji(self, interaction: discord.Interaction) -> None:
-        if interaction.guild is None or not isinstance(
-            interaction.user, discord.Member
-        ):
-            await interaction.response.send_message(
-                "This control only works inside a server.",
-                ephemeral=True,
-            )
-            return
-
-        row = await bot.get_or_create_stats(
-            interaction.guild.id,
-            interaction.user.id,
-        )
-        level = level_from_total_seconds(row["total_voice_seconds"])
-        unlocks = await bot.get_emoji_unlocks(interaction.guild.id)
-        raw_selection = str(row["selected_emoji"] or "").strip()
-
-        if not raw_selection:
-            current_badge = valid_selected_emoji("", level, unlocks)
-            if not current_badge:
-                await interaction.response.send_message(
-                    "You need to unlock a badge before Auto Upgrade can be paused.",
-                    ephemeral=True,
-                )
-                return
-            new_selection = current_badge
-            auto_enabled = False
-        else:
-            new_selection = ""
-            auto_enabled = True
-
-        await interaction.response.defer(ephemeral=True)
-        await bot.pool.execute(
-            "UPDATE voice_levels SET selected_emoji = $1 "
-            "WHERE guild_id = $2 AND user_id = $3;",
-            new_selection,
-            interaction.guild.id,
-            interaction.user.id,
-        )
-        result = await bot.apply_level_nickname(
-            interaction.user,
-            level,
-            new_selection,
-        )
-        if result in {"updated", "unchanged"}:
-            await bot.mark_nickname_synced(
-                interaction.guild.id,
-                interaction.user.id,
-                level,
-            )
-
-        displayed_badge = valid_selected_emoji(new_selection, level, unlocks)
-        if auto_enabled:
-            embed = discord.Embed(
-                title="⚡ Auto Upgrade Activated",
-                description=(
-                    "Your nickname will now automatically use your newest unlocked badge "
-                    "whenever you reach a badge level."
-                ),
-                color=discord.Color.from_rgb(88, 145, 255),
-            )
-            embed.add_field(name="Status", value="🟢 **ON**", inline=True)
-            embed.add_field(
-                name="Current Badge",
-                value=f"**{displayed_badge or 'None'}**",
-                inline=True,
-            )
-        else:
-            embed = discord.Embed(
-                title="⏸️ Auto Upgrade Paused",
-                description=(
-                    f"Your {new_selection} badge is now locked in and will not change "
-                    "when you level up."
-                ),
-                color=discord.Color.from_rgb(255, 184, 77),
-            )
-            embed.add_field(name="Status", value="⏸️ **OFF**", inline=True)
-            embed.add_field(
-                name="Locked Badge",
-                value=f"**{new_selection}**",
-                inline=True,
-            )
-
-        if result not in {"updated", "unchanged"}:
-            embed.add_field(
-                name="Nickname Update",
-                value=(
-                    "Your setting was saved, but Discord blocked the nickname edit. "
-                    "Check the bot's **Manage Nicknames** permission and role position."
-                ),
-                inline=False,
-            )
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-    async def view_nickname_card(self, interaction: discord.Interaction) -> None:
-        if interaction.guild is None or not isinstance(
-            interaction.user, discord.Member
-        ):
-            await interaction.response.send_message(
-                "This control only works inside a server.",
-                ephemeral=True,
-            )
-            return
-
-        row = await bot.get_or_create_stats(
-            interaction.guild.id,
-            interaction.user.id,
-        )
-        total_seconds = int(row["total_voice_seconds"])
-        level = level_from_total_seconds(total_seconds)
-        unlocks = await bot.get_emoji_unlocks(interaction.guild.id)
-        raw_selection = str(row["selected_emoji"] or "").strip()
-        current = valid_selected_emoji(raw_selection, level, unlocks)
-        available = unlocked_emojis(level, unlocks)
-        next_unlock = next_emoji_unlock(level, unlocks)
-        auto_enabled = not raw_selection
-
-        if auto_enabled:
-            mode_text = "⚡ Auto Upgrade"
-        elif raw_selection == NO_EMOJI_SELECTION:
-            mode_text = "🚫 No Badge"
-        else:
-            mode_text = "🔒 Badge Locked"
-
-        embed = discord.Embed(
-            title="✦ Your Nickname Card",
-            description=(
-                f"`{nickname_with_level(interaction.user, level, raw_selection, unlocks)}`\n"
-                "A private snapshot of your current nickname setup."
-            ),
-            color=discord.Color.from_rgb(118, 82, 255),
-        )
-        embed.set_thumbnail(url=interaction.user.display_avatar.url)
-        embed.add_field(name="Voice Level", value=f"**{level}**", inline=True)
-        embed.add_field(
-            name="Current Badge",
-            value=f"**{current or 'None'}**",
-            inline=True,
-        )
-        embed.add_field(name="Mode", value=mode_text, inline=True)
-        embed.add_field(
-            name="Unlocked Vault",
-            value=f"**{len(available)}** badge(s)",
-            inline=True,
-        )
-        embed.add_field(
-            name="Voice Time",
-            value=f"**{format_duration(total_seconds)}**",
-            inline=True,
-        )
-        embed.add_field(
-            name="Next Badge",
-            value=(
-                f"{next_unlock[1]} at **Level {next_unlock[0]}**"
-                if next_unlock is not None
-                else "All badges unlocked"
-            ),
-            inline=True,
-        )
-        embed.set_footer(
-            text="Use Badge Vault to lock a badge • Use Auto Upgrade to follow your level"
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-class EmojiBulkEditModal(discord.ui.Modal):
-    """Private popup used to replace every emoji unlock in one paste."""
-
-    def __init__(self, guild_id: int, current_block: str) -> None:
-        super().__init__(title="Edit All Emoji Unlocks", timeout=600)
-        self.guild_id = guild_id
-        self.emoji_list = discord.ui.TextInput(
-            label="One level=emoji entry per line",
-            style=discord.TextStyle.paragraph,
-            default=current_block,
-            placeholder="0=⚪\n1=🟣\n5=⭐\n10=💎",
-            required=True,
-            max_length=4000,
-        )
-        self.add_item(self.emoji_list)
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        if interaction.guild is None or interaction.guild.id != self.guild_id:
-            await interaction.response.send_message(
-                "This emoji editor is no longer connected to the correct server.",
-                ephemeral=True,
-            )
-            return
-
-        member = interaction.user
-        if (
-            not isinstance(member, discord.Member)
-            or not member.guild_permissions.manage_guild
-        ):
-            await interaction.response.send_message(
-                "You need the **Manage Server** permission to edit all emojis.",
-                ephemeral=True,
-            )
-            return
-
-        try:
-            parsed = parse_bulk_emoji_unlocks(str(self.emoji_list.value))
-            # Reuse the normal Unicode validation so bulk edits follow the same rules.
-            unlocks = tuple(
-                (required_level, validate_display_emoji(emoji))
-                for required_level, emoji in parsed
-            )
-        except ValueError as exc:
-            await interaction.response.send_message(str(exc), ephemeral=True)
-            return
-
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        # Fetch offline members before mass syncing when Discord has not fully
-        # populated the guild member cache yet.
-        if not interaction.guild.chunked:
-            try:
-                await interaction.guild.chunk(cache=True)
-            except Exception:
-                log.exception(
-                    "Could not fully refresh the member cache before emoji bulk sync "
-                    "for guild %s",
-                    interaction.guild.id,
-                )
-
-        reset_count = await bot.replace_all_emoji_unlocks(
-            interaction.guild.id,
-            unlocks,
-        )
-
-        # Verify the saved database schedule before updating nicknames and replying.
-        saved_unlocks = await bot.get_emoji_unlocks(
-            interaction.guild.id,
-            force_refresh=True,
-        )
-        expected_unlocks = tuple(
-            (required_level, emoji, emoji)
-            for required_level, emoji in unlocks
-        )
-        if saved_unlocks != expected_unlocks:
-            log.error(
-                "Emoji bulk-save verification failed for guild %s: expected=%r saved=%r",
-                interaction.guild.id,
-                expected_unlocks,
-                saved_unlocks,
-            )
-            await interaction.followup.send(
-                "The emoji schedule could not be verified after saving. "
-                "Nothing else was changed; check the bot logs and try again.",
-                ephemeral=True,
-            )
-            return
-
-        updated, unchanged, skipped = await bot.sync_guild_nicknames(
-            interaction.guild
-        )
-        await interaction.followup.send(
-            f"Saved and verified **{len(saved_unlocks)}** emoji unlock(s) at once.\n"
-            f"Recalculated emoji mode for **{reset_count}** saved member(s). "
-            "Everyone was returned to **Auto Upgrade** so the new level schedule "
-            "could take effect.\n"
-            f"Nicknames updated: **{updated}**, already correct: **{unchanged}**, "
-            f"skipped: **{skipped}**.\n"
-            "Both `/emoji list` and `/emojiadmin list` now use this exact saved schedule.",
-            ephemeral=True,
-        )
-
-
 async def configured_emoji_autocomplete(
     interaction: discord.Interaction,
     current: str,
@@ -2561,52 +1784,6 @@ async def configured_emoji_autocomplete(
             continue
         choices.append(app_commands.Choice(name=label[:100], value=emoji))
     return choices[:25]
-
-
-@emoji_admin_group.command(
-    name="panel",
-    description="Post the public Nickname Panel control panel.",
-)
-@app_commands.guild_only()
-@app_commands.default_permissions(manage_guild=True)
-@app_commands.checks.has_permissions(manage_guild=True)
-async def emoji_admin_panel(interaction: discord.Interaction) -> None:
-    assert interaction.guild is not None
-
-    thumbnail_url: str | None = None
-    if interaction.client.user is not None:
-        thumbnail_url = interaction.client.user.display_avatar.url
-
-    await interaction.response.send_message(
-        view=EmojiControlPanelView(
-            guild_name=interaction.guild.name,
-            thumbnail_url=thumbnail_url,
-        )
-    )
-
-
-@emoji_admin_group.command(
-    name="editall",
-    description="Open one popup to copy, paste, and replace every emoji unlock.",
-)
-@app_commands.guild_only()
-@app_commands.default_permissions(manage_guild=True)
-@app_commands.checks.has_permissions(manage_guild=True)
-async def emoji_admin_edit_all(interaction: discord.Interaction) -> None:
-    assert interaction.guild is not None
-    unlocks = await bot.get_emoji_unlocks(interaction.guild.id)
-    current_block = format_emoji_unlock_block(unlocks)
-    if len(current_block) > 4000:
-        await interaction.response.send_message(
-            "There are too many configured entries to fit in Discord's editor. "
-            "Remove a few entries first with `/emojiadmin remove`.",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.send_modal(
-        EmojiBulkEditModal(interaction.guild.id, current_block)
-    )
 
 
 @emoji_admin_group.command(
@@ -2644,6 +1821,54 @@ async def emoji_admin_set(
 
 
 @emoji_admin_group.command(
+    name="replace",
+    description="Replace an old Unicode emoji while preserving selections.",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.describe(
+    old_emoji="The currently configured Unicode emoji",
+    new_emoji="The new Unicode emoji",
+    level="The new required level",
+)
+@app_commands.autocomplete(old_emoji=configured_emoji_autocomplete)
+async def emoji_admin_replace(
+    interaction: discord.Interaction,
+    old_emoji: str,
+    new_emoji: str,
+    level: app_commands.Range[int, 0, 100000],
+) -> None:
+    assert interaction.guild is not None
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        changed, _saved_badge = await bot.replace_emoji_unlock(
+            interaction.guild.id,
+            old_emoji,
+            new_emoji,
+            int(level),
+        )
+    except ValueError as exc:
+        await interaction.followup.send(str(exc), ephemeral=True)
+        return
+
+    if not changed:
+        await interaction.followup.send(
+            "That old emoji is not configured. Use `/emojiadmin list`.",
+            ephemeral=True,
+        )
+        return
+
+    updated, unchanged, skipped = await bot.sync_guild_nicknames(interaction.guild)
+    await interaction.followup.send(
+        f"Replaced {old_emoji} with {new_emoji} at **Level {level}**.\n"
+        f"Nicknames updated: **{updated}**, already correct: **{unchanged}**, "
+        f"skipped: **{skipped}**.",
+        ephemeral=True,
+    )
+
+
+@emoji_admin_group.command(
     name="remove",
     description="Remove an emoji unlock from this server.",
 )
@@ -2661,7 +1886,7 @@ async def emoji_admin_remove(
     unlocks = await bot.get_emoji_unlocks(interaction.guild.id)
     if len(unlocks) <= 1:
         await interaction.followup.send(
-            "You must keep at least one configured emoji. Use `/emojiadmin editall` "
+            "You must keep at least one configured emoji. Use `/emojiadmin replace` "
             "to change the final emoji instead.",
             ephemeral=True,
         )
@@ -2692,11 +1917,7 @@ async def emoji_admin_remove(
 async def emoji_admin_list(interaction: discord.Interaction) -> None:
     """This is the only /emojiadmin subcommand available to every member."""
     assert interaction.guild is not None
-    # Always read the database so the admin list exactly matches editall.
-    unlocks = await bot.get_emoji_unlocks(
-        interaction.guild.id,
-        force_refresh=True,
-    )
+    unlocks = await bot.get_emoji_unlocks(interaction.guild.id)
     lines: list[str] = []
     for required_level, emoji, _nickname_badge in unlocks:
         lines.append(f"{emoji} — Level **{required_level}**")
@@ -2707,8 +1928,8 @@ async def emoji_admin_list(interaction: discord.Interaction) -> None:
     )
     embed.set_footer(
         text=(
-            "Everyone can use this list. Managers can use /emojiadmin editall "
-            "to replace everything with one paste."
+            "Everyone can use this list. Only members with Manage Server can "
+            "use set, replace, remove, or reset."
         )
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -2753,8 +1974,6 @@ bot.tree.add_command(emoji_admin_group)
     description="Check voice tracking, database, and nickname permissions.",
 )
 @app_commands.guild_only()
-@app_commands.default_permissions(manage_guild=True)
-@app_commands.checks.has_permissions(manage_guild=True)
 async def level_status(interaction: discord.Interaction) -> None:
     assert interaction.guild is not None
     await interaction.response.defer(ephemeral=True, thinking=True)
@@ -2786,7 +2005,8 @@ async def level_status(interaction: discord.Interaction) -> None:
         value=(
             f"At least **{MIN_HUMANS_IN_VC}** eligible human(s) in voice\n"
             f"Deafened users: **not counted**\n"
-            f"Muted users: **{'not counted' if REQUIRE_UNMUTED else 'counted'}**"
+            f"Muted users: **{'not counted' if REQUIRE_UNMUTED else 'counted'}**\n"
+            f"Server Booster role XP: **{SERVER_BOOSTER_XP_MULTIPLIER}× while assigned, 1× when removed**"
         ),
         inline=False,
     )
