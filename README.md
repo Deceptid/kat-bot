@@ -1,101 +1,121 @@
-# Discord Voice Level Bot
+# Kat — Combined Discord Bot
 
-A `discord.py` bot that:
+This project combines both uploaded bots into one `discord.py` application named **Kat**.
 
-- Awards time for qualifying voice-channel activity.
-- Makes each next level take longer.
-- Adds a superscript level to the end of a member's server nickname, such as `Aidan ¹²`.
-- Stores progress in Postgres.
-- Provides `/rank`, `/leaderboard`, `/syncnickname`, and `/syncallnicknames`.
+## Included features
 
-## How voice time qualifies
+### Voice leveling
 
-By default, a member earns time when:
+- Tracks qualifying voice activity.
+- Calculates levels using the existing level curve.
+- Updates member nicknames with an emoji, `│`, and superscript level.
+- Formats editable bot accounts as `🤖│BotName`.
+- Keeps the existing emoji unlock and administration commands.
+- Includes `/rank`, `/leaderboard`, `/syncnickname`, `/syncallnicknames`, `/emoji`, `/emojiadmin`, and `/levelstatus`.
 
-1. They are in a voice or stage channel.
-2. They are not a bot.
-3. They are not self-deafened or server-deafened.
-4. The channel contains at least two qualifying human members.
-5. The channel is not the server AFK channel.
+### Kat LFG alerts
 
-This tracks qualifying time in voice channels. It does **not** record audio or inspect what anyone says.
+- `/ping` has no options.
+- It copies the current forum post/thread name automatically.
+- It DMs members who have the configured alert role.
+- It includes a link back to the exact LFG post.
+- It includes the inviter's voice channel when they are already in one.
+- Members can mute or unmute alerts from that server using the button in the DM.
+- Cooldowns and delivery history are stored in PostgreSQL.
 
-## Level formula
+## Discord application setup
 
-The time from level `L` to `L + 1` is:
-
-```text
-BASE_HOURS + (HOURS_PER_LEVEL × L)
-```
-
-Defaults:
-
-- Level 0 → 1: 1 hour
-- Level 1 → 2: 1 hour 15 minutes
-- Level 5 → 6: 2 hours 15 minutes
-- Level 10 → 11: 3 hours 30 minutes
-
-Change `BASE_HOURS` and `HOURS_PER_LEVEL` in your hosting environment variables.
-
-## Discord bot setup
-
-1. Open the Discord Developer Portal and create a new application.
-2. Open **Bot**, create the bot, and reset/copy its token.
-3. Under **Privileged Gateway Intents**, enable **Server Members Intent**.
-4. Open **OAuth2 → URL Generator**.
-5. Select scopes:
+1. Open the Discord Developer Portal and create one application named **Kat**.
+2. Create its bot user and copy the token.
+3. Enable **Server Members Intent** under the bot's privileged intents.
+4. Install the bot with both scopes:
    - `bot`
    - `applications.commands`
-6. Select bot permissions:
+5. Give Kat these permissions:
    - View Channels
    - Send Messages
    - Embed Links
+   - Read Message History
    - Manage Nicknames
-7. Use the generated URL to invite the bot.
-8. In **Server Settings → Roles**, drag the bot's role above every role whose nickname it should edit.
+   - Change Nickname
+6. Move Kat's role above members and bots whose nicknames it should edit.
 
-Do not give the bot Administrator unless you deliberately want to.
+The application name is changed in the Discord Developer Portal. `BOT_NAME=Kat` controls the name displayed in LFG alert messages.
 
-## Neon database setup
+## LFG setup
 
-1. Create a free Neon project.
-2. Open the project and click **Connect**.
-3. Turn on **Connection pooling**.
-4. Copy the connection string.
-5. Save it as the `DATABASE_URL` environment variable.
+Create a role for members who should receive game-alert DMs, such as `LFG Alerts`.
 
-The bot creates its table and index automatically on first startup.
+Copy that role ID into `PING_ROLE_ID`.
 
-## Railway hosting setup
+For a forum channel, put the **forum channel ID** in `LFG_CHANNEL_IDS`. Kat accepts `/ping` inside posts created under that forum. For multiple channels, separate IDs with commas.
 
-1. Put these files in a GitHub repository.
-2. In Railway, create a project and choose **Deploy from GitHub repo**.
-3. Select your repository.
-4. Open the service's **Variables** tab and add:
-   - `DISCORD_TOKEN`
-   - `DATABASE_URL`
-   - `TEST_GUILD_ID` (optional but useful while testing)
-   - the other settings from `.env.example`
-5. Railway should detect Python. The included `railway.toml` starts the bot with `python bot.py`.
-6. Open **Deployments / Logs** and look for `Logged in as ...`.
+Example:
 
-Never upload a real `.env` file or bot token to GitHub.
-
-## Local test, optional
-
-```bash
-python -m venv .venv
+```env
+PING_ROLE_ID=123456789012345678
+LFG_CHANNEL_IDS=234567890123456789,345678901234567890
 ```
 
-Windows PowerShell:
+`PINGER_ROLE_ID=0` allows everyone to use `/ping`. Set it to a role ID to restrict the command to that role, Manage Server users, and Manage Messages users.
 
-```powershell
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-copy .env.example .env
+## Railway deployment
+
+1. Upload this folder to a GitHub repository.
+2. Create a Railway project and deploy the repository.
+3. Add one PostgreSQL service.
+4. Add the variables from `.env.example` to the Kat service.
+5. Reference Railway PostgreSQL's `DATABASE_URL` from the Kat service.
+6. Railway can use the included Dockerfile automatically. The manual start command is:
+
+```text
 python bot.py
 ```
 
-## Important nickname limitation
+### Recommended Railway variables
 
-Discord nicknames are limited to 32 characters. The bot shortens the base nickname when needed so the superscript level still fits. It cannot edit the server owner's nickname or anyone whose highest role is equal to or above the bot's highest role.
+```env
+DISCORD_TOKEN=your_new_kat_bot_token
+DATABASE_URL=${{Postgres.DATABASE_URL}}
+TEST_GUILD_ID=your_server_id
+
+BOT_NAME=Kat
+PING_ROLE_ID=your_lfg_alert_role_id
+PINGER_ROLE_ID=0
+LFG_CHANNEL_IDS=your_lfg_forum_or_channel_id
+COOLDOWN_MINUTES=15
+MAX_RECIPIENTS=500
+DM_DELAY_SECONDS=0.20
+
+LEVEL_UP_CHANNEL_ID=0
+BASE_HOURS=1.0
+HOURS_PER_LEVEL=0.25
+TICK_SECONDS=60
+MIN_HUMANS_IN_VC=1
+REQUIRE_UNMUTED=false
+SYNC_NICKNAMES_ON_START=true
+```
+
+## Keeping existing voice levels
+
+Use the same `DATABASE_URL` that the voice-level bot already used. Kat will reuse the existing voice-level tables and automatically create the new KatPing tables.
+
+When the two old bots used separate databases, one combined bot can connect to only one `DATABASE_URL` at a time. Using the voice-level database preserves levels; old KatPing delivery history from another database is not copied automatically.
+
+## Testing
+
+Inside an approved LFG forum post, run:
+
+```text
+/ping
+```
+
+The DM title and link will use that post's name automatically.
+
+Then test:
+
+```text
+/rank
+/levelstatus
+/syncallnicknames
+```
