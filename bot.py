@@ -6,6 +6,8 @@ import math
 import os
 import re
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Iterable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -21,12 +23,43 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-log = logging.getLogger("voice-level-bot")
+log = logging.getLogger("kat")
 
 
 def env_flag(name: str, default: bool = False) -> bool:
     fallback = "true" if default else "false"
     return os.getenv(name, fallback).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_int(name: str, default: int = 0) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        return int(raw or default)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a whole number.") from exc
+
+
+def env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a number.") from exc
+
+
+def parse_id_list(raw: str) -> set[int]:
+    ids: set[int] = set()
+    for piece in raw.split(","):
+        piece = piece.strip()
+        if not piece:
+            continue
+        try:
+            ids.add(int(piece))
+        except ValueError as exc:
+            raise RuntimeError(
+                "LFG_CHANNEL_IDS must contain Discord channel IDs separated by commas."
+            ) from exc
+    return ids
 
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
@@ -37,11 +70,19 @@ LEVEL_UP_CHANNEL_ID = int(os.getenv("LEVEL_UP_CHANNEL_ID", "0") or 0)
 BASE_HOURS = float(os.getenv("BASE_HOURS", "1.0"))
 HOURS_PER_LEVEL = float(os.getenv("HOURS_PER_LEVEL", "0.25"))
 TICK_SECONDS = max(15, int(os.getenv("TICK_SECONDS", "60")))
-SERVER_BOOSTER_XP_MULTIPLIER = 2
 # Use 1 to count a member who is alone in voice. Set this to 2 to require company.
 MIN_HUMANS_IN_VC = max(1, int(os.getenv("MIN_HUMANS_IN_VC", "1")))
 REQUIRE_UNMUTED = env_flag("REQUIRE_UNMUTED", default=False)
 SYNC_NICKNAMES_ON_START = env_flag("SYNC_NICKNAMES_ON_START", default=True)
+
+# KatPing LFG alert settings. The same Kat bot and PostgreSQL database are used.
+PING_ROLE_ID = env_int("PING_ROLE_ID", 0)
+PINGER_ROLE_ID = env_int("PINGER_ROLE_ID", 0)
+LFG_CHANNEL_IDS = parse_id_list(os.getenv("LFG_CHANNEL_IDS", ""))
+COOLDOWN_MINUTES = max(0, env_int("COOLDOWN_MINUTES", 15))
+MAX_RECIPIENTS = max(1, env_int("MAX_RECIPIENTS", 500))
+DM_DELAY_SECONDS = max(0.0, env_float("DM_DELAY_SECONDS", 0.20))
+BOT_NAME = os.getenv("BOT_NAME", "Kat").strip() or "Kat"
 
 # Default Unicode badge entries. These seed each server's database.
 # Custom Discord emoji codes are intentionally not supported in nicknames.
@@ -172,13 +213,37 @@ CREATE TABLE IF NOT EXISTS bot_migrations (
     completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (guild_id, migration_key)
 );
+
+CREATE TABLE IF NOT EXISTS katping_opt_outs (
+    guild_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    opted_out_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (guild_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS katping_ping_log (
+    id BIGSERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    inviter_id BIGINT NOT NULL,
+    channel_id BIGINT NOT NULL,
+    post_name TEXT NOT NULL,
+    game_name TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    delivered_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    skipped_count INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS katping_ping_log_guild_created_idx
+ON katping_ping_log (guild_id, created_at DESC);
 """
 
 UPSERT_ACTIVE_SQL = """
 WITH incoming AS (
     SELECT *
-    FROM UNNEST($1::BIGINT[], $2::BIGINT[], $3::BIGINT[])
-         AS t(guild_id, user_id, earned_seconds)
+    FROM UNNEST($1::BIGINT[], $2::BIGINT[])
+         AS t(guild_id, user_id)
 )
 INSERT INTO voice_levels (
     guild_id,
@@ -188,7 +253,7 @@ INSERT INTO voice_levels (
     nickname_level,
     last_active_at
 )
-SELECT guild_id, user_id, earned_seconds, 0, -1, NOW()
+SELECT guild_id, user_id, $3, 0, -1, NOW()
 FROM incoming
 ON CONFLICT (guild_id, user_id)
 DO UPDATE SET
@@ -438,16 +503,107 @@ def member_is_eligible(member: discord.Member) -> bool:
     return True
 
 
-def member_is_server_booster(member: discord.Member) -> bool:
-    """Return True only while the member currently has Discord's Booster role."""
-    return any(role.is_premium_subscriber() for role in member.roles)
+@dataclass(frozen=True)
+class LfgContext:
+    post_name: str
+    channel_name: str
+    channel_id: int
+    allowed_channel_id: int
+    jump_url: str
 
 
-def voice_xp_multiplier(member: discord.Member) -> int:
-    return SERVER_BOOSTER_XP_MULTIPLIER if member_is_server_booster(member) else 1
+def get_lfg_context(
+    guild: discord.Guild,
+    channel: discord.abc.GuildChannel | discord.Thread,
+) -> LfgContext:
+    if isinstance(channel, discord.Thread):
+        parent = channel.parent
+        allowed_channel_id = parent.id if parent is not None else channel.id
+        channel_name = parent.name if parent is not None else "LFG"
+        post_name = channel.name
+    else:
+        allowed_channel_id = channel.id
+        channel_name = channel.name
+        post_name = channel.name.replace("-", " ").title()
+
+    jump_url = f"https://discord.com/channels/{guild.id}/{channel.id}"
+    return LfgContext(
+        post_name=post_name,
+        channel_name=channel_name,
+        channel_id=channel.id,
+        allowed_channel_id=allowed_channel_id,
+        jump_url=jump_url,
+    )
 
 
-class VoiceLevelBot(commands.Bot):
+def footer_guild_id(embed: discord.Embed) -> int | None:
+    text = embed.footer.text or ""
+    match = re.search(r"Guild ID: (\d{15,22})", text)
+    return int(match.group(1)) if match else None
+
+
+class AlertToggleView(discord.ui.View):
+    """Persistent mute/unmute button included in every Kat game-alert DM."""
+
+    def __init__(self, bot: "KatBot") -> None:
+        super().__init__(timeout=None)
+        self.bot = bot
+
+    @discord.ui.button(
+        label="Mute / unmute this server",
+        style=discord.ButtonStyle.secondary,
+        emoji="🔕",
+        custom_id="katping:toggle_server_alerts",
+    )
+    async def toggle_alerts(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        if interaction.message is None or not interaction.message.embeds:
+            await interaction.response.send_message(
+                "I could not identify which server this alert came from."
+            )
+            return
+
+        guild_id = footer_guild_id(interaction.message.embeds[0])
+        if guild_id is None:
+            await interaction.response.send_message(
+                "I could not identify which server this alert came from."
+            )
+            return
+
+        existing = await self.bot.pool.fetchval(
+            "SELECT 1 FROM katping_opt_outs WHERE guild_id = $1 AND user_id = $2;",
+            guild_id,
+            interaction.user.id,
+        )
+
+        if existing:
+            await self.bot.pool.execute(
+                "DELETE FROM katping_opt_outs WHERE guild_id = $1 AND user_id = $2;",
+                guild_id,
+                interaction.user.id,
+            )
+            await interaction.response.send_message(
+                "🔔 Kat game alerts from that server are enabled again."
+            )
+        else:
+            await self.bot.pool.execute(
+                """
+                INSERT INTO katping_opt_outs (guild_id, user_id)
+                VALUES ($1, $2)
+                ON CONFLICT (guild_id, user_id) DO NOTHING;
+                """,
+                guild_id,
+                interaction.user.id,
+            )
+            await interaction.response.send_message(
+                "🔕 Kat game alerts from that server are muted. Press the button again to unmute them."
+            )
+
+
+class KatBot(commands.Bot):
     pool: asyncpg.Pool
 
     def __init__(self) -> None:
@@ -488,6 +644,9 @@ class VoiceLevelBot(commands.Bot):
                 )
                 await asyncio.sleep(delay)
 
+        # Keep the KatPing mute/unmute button active after Railway restarts.
+        self.add_view(AlertToggleView(self))
+
         if TEST_GUILD_ID:
             guild = discord.Object(id=TEST_GUILD_ID)
             self.tree.copy_global_to(guild=guild)
@@ -509,6 +668,65 @@ class VoiceLevelBot(commands.Bot):
         if hasattr(self, "pool"):
             await self.pool.close()
         await super().close()
+
+    async def opted_out_user_ids(self, guild_id: int) -> set[int]:
+        rows = await self.pool.fetch(
+            "SELECT user_id FROM katping_opt_outs WHERE guild_id = $1;",
+            guild_id,
+        )
+        return {int(row["user_id"]) for row in rows}
+
+    async def cooldown_remaining(self, guild_id: int) -> int:
+        if COOLDOWN_MINUTES <= 0:
+            return 0
+
+        last_ping = await self.pool.fetchval(
+            "SELECT MAX(created_at) FROM katping_ping_log WHERE guild_id = $1;",
+            guild_id,
+        )
+        if last_ping is None:
+            return 0
+
+        now = datetime.now(timezone.utc)
+        elapsed = int((now - last_ping).total_seconds())
+        cooldown_seconds = COOLDOWN_MINUTES * 60
+        return max(0, cooldown_seconds - elapsed)
+
+    async def log_ping(
+        self,
+        *,
+        guild_id: int,
+        inviter_id: int,
+        context: LfgContext,
+        game_name: str,
+        delivered: int,
+        failed: int,
+        skipped: int,
+    ) -> None:
+        await self.pool.execute(
+            """
+            INSERT INTO katping_ping_log (
+                guild_id,
+                inviter_id,
+                channel_id,
+                post_name,
+                game_name,
+                note,
+                delivered_count,
+                failed_count,
+                skipped_count
+            )
+            VALUES ($1, $2, $3, $4, $5, '', $6, $7, $8);
+            """,
+            guild_id,
+            inviter_id,
+            context.channel_id,
+            context.post_name,
+            game_name,
+            delivered,
+            failed,
+            skipped,
+        )
 
     async def get_emoji_unlocks(
         self,
@@ -1154,9 +1372,7 @@ class VoiceLevelBot(commands.Bot):
         )
         self._last_tick_monotonic = now
 
-        # Store a separate earned amount for each member because boosters earn
-        # twice the voice XP during the same real-time tick.
-        active_earnings: dict[tuple[int, int], int] = {}
+        active_pairs: list[tuple[int, int]] = []
 
         for guild in self.guilds:
             channels: list[discord.abc.Connectable] = [
@@ -1175,27 +1391,23 @@ class VoiceLevelBot(commands.Bot):
                 if len(eligible_members) < MIN_HUMANS_IN_VC:
                     continue
 
-                for member in eligible_members:
-                    earned_seconds = elapsed * voice_xp_multiplier(member)
-                    active_earnings[(guild.id, member.id)] = earned_seconds
+                active_pairs.extend(
+                    (guild.id, member.id) for member in eligible_members
+                )
 
-        if not active_earnings:
+        if not active_pairs:
             return
 
-        active_entries = [
-            (guild_id, user_id, earned_seconds)
-            for (guild_id, user_id), earned_seconds in active_earnings.items()
-        ]
-        guild_ids = [entry[0] for entry in active_entries]
-        user_ids = [entry[1] for entry in active_entries]
-        earned_seconds = [entry[2] for entry in active_entries]
+        active_pairs = list(dict.fromkeys(active_pairs))
+        guild_ids = [pair[0] for pair in active_pairs]
+        user_ids = [pair[1] for pair in active_pairs]
 
         try:
             rows = await self.pool.fetch(
                 UPSERT_ACTIVE_SQL,
                 guild_ids,
                 user_ids,
-                earned_seconds,
+                elapsed,
             )
             await self.process_level_changes(rows)
         except Exception:
@@ -1206,7 +1418,7 @@ class VoiceLevelBot(commands.Bot):
         await self.wait_until_ready()
 
 
-bot = VoiceLevelBot()
+bot = KatBot()
 
 
 @bot.event
@@ -1324,6 +1536,220 @@ async def on_voice_state_update(
         await bot.mark_nickname_synced(member.guild.id, member.id, level)
 
 
+def member_can_ping(member: discord.Member) -> bool:
+    if member.guild_permissions.manage_guild or member.guild_permissions.manage_messages:
+        return True
+    if PINGER_ROLE_ID <= 0:
+        return True
+    return any(role.id == PINGER_ROLE_ID for role in member.roles)
+
+
+def format_wait(seconds: int) -> str:
+    minutes, secs = divmod(max(0, seconds), 60)
+    if minutes and secs:
+        return f"{minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m"
+    return f"{secs}s"
+
+
+def build_alert_embed(
+    *,
+    guild: discord.Guild,
+    inviter: discord.Member,
+    context: LfgContext,
+    voice_channel: discord.VoiceChannel | None,
+) -> discord.Embed:
+    safe_post = discord.utils.escape_markdown(context.post_name)
+    safe_inviter = discord.utils.escape_markdown(inviter.display_name)
+
+    embed = discord.Embed(
+        title=f"🐱 {BOT_NAME} LFG alert",
+        url=context.jump_url,
+        description=(
+            f"**{safe_inviter}** is inviting players to **{safe_post}**.\n\n"
+            f"The game name was copied automatically from the current LFG post."
+        ),
+        color=discord.Color.from_rgb(237, 105, 168),
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    if voice_channel is not None:
+        embed.add_field(
+            name="They are in voice",
+            value=f"{voice_channel.mention}\nOpen the server and join the channel.",
+            inline=False,
+        )
+
+    embed.add_field(
+        name="Open the LFG post",
+        value=f"[Join **{safe_post}**]({context.jump_url})",
+        inline=False,
+    )
+    embed.set_footer(text=f"{guild.name} • Guild ID: {guild.id}")
+    return embed
+
+
+async def send_alert(member: discord.Member, embed: discord.Embed) -> bool:
+    try:
+        await member.send(embed=embed, view=AlertToggleView(bot))
+        if DM_DELAY_SECONDS:
+            await asyncio.sleep(DM_DELAY_SECONDS)
+        return True
+    except (discord.Forbidden, discord.NotFound):
+        return False
+    except discord.HTTPException:
+        log.exception("Discord rejected a Kat game-alert DM to user %s", member.id)
+        return False
+
+
+@bot.tree.command(
+    name="ping",
+    description="DM the LFG alert role using the current post name.",
+)
+@app_commands.guild_only()
+async def ping_command(interaction: discord.Interaction) -> None:
+    guild = interaction.guild
+    channel = interaction.channel
+    user = interaction.user
+
+    if guild is None or channel is None or not isinstance(user, discord.Member):
+        await interaction.response.send_message(
+            "This command only works inside a Discord server.",
+            ephemeral=True,
+        )
+        return
+
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        await interaction.response.send_message(
+            "Use `/ping` inside an approved LFG text channel or forum post.",
+            ephemeral=True,
+        )
+        return
+
+    if PING_ROLE_ID <= 0 or not LFG_CHANNEL_IDS:
+        await interaction.response.send_message(
+            "Kat's LFG alerts are not configured yet. Add `PING_ROLE_ID` and "
+            "`LFG_CHANNEL_IDS` in Railway.",
+            ephemeral=True,
+        )
+        return
+
+    context = get_lfg_context(guild, channel)
+    if context.allowed_channel_id not in LFG_CHANNEL_IDS:
+        await interaction.response.send_message(
+            "Use `/ping` inside one of the LFG channels configured in Railway.",
+            ephemeral=True,
+        )
+        return
+
+    if not member_can_ping(user):
+        await interaction.response.send_message(
+            "You do not have permission to send Kat LFG alerts.",
+            ephemeral=True,
+        )
+        return
+
+    remaining = await bot.cooldown_remaining(guild.id)
+    if remaining > 0 and not user.guild_permissions.manage_guild:
+        await interaction.response.send_message(
+            f"Kat LFG alerts are on cooldown for **{format_wait(remaining)}**.",
+            ephemeral=True,
+        )
+        return
+
+    role = guild.get_role(PING_ROLE_ID)
+    if role is None:
+        await interaction.response.send_message(
+            "The `PING_ROLE_ID` role does not exist. Update the Railway variable.",
+            ephemeral=True,
+        )
+        return
+
+    # The alert title always comes from the current forum/thread post name.
+    game_name = context.post_name.strip()
+
+    voice_channel: discord.VoiceChannel | None = None
+    if user.voice is not None and isinstance(user.voice.channel, discord.VoiceChannel):
+        voice_channel = user.voice.channel
+
+    opted_out = await bot.opted_out_user_ids(guild.id)
+    role_members: Iterable[discord.Member] = role.members
+    recipients = [
+        member
+        for member in role_members
+        if not member.bot
+        and member.id != user.id
+        and member.id not in opted_out
+    ]
+
+    skipped = len(role.members) - len(recipients)
+    if not recipients:
+        await interaction.response.send_message(
+            f"There are no eligible members in **{role.name}** to DM.",
+            ephemeral=True,
+        )
+        return
+
+    if len(recipients) > MAX_RECIPIENTS:
+        skipped += len(recipients) - MAX_RECIPIENTS
+        recipients = recipients[:MAX_RECIPIENTS]
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    embed = build_alert_embed(
+        guild=guild,
+        inviter=user,
+        context=context,
+        voice_channel=voice_channel,
+    )
+
+    delivered = 0
+    failed = 0
+    for member in recipients:
+        if await send_alert(member, embed):
+            delivered += 1
+        else:
+            failed += 1
+
+    await bot.log_ping(
+        guild_id=guild.id,
+        inviter_id=user.id,
+        context=context,
+        game_name=game_name,
+        delivered=delivered,
+        failed=failed,
+        skipped=skipped,
+    )
+
+    await interaction.followup.send(
+        (
+            f"🐱 **{BOT_NAME} alert sent for {game_name}.**\n"
+            f"Delivered: **{delivered}** · Could not DM: **{failed}** · "
+            f"Skipped: **{skipped}**"
+        ),
+        ephemeral=True,
+    )
+
+
+@ping_command.error
+async def ping_command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+) -> None:
+    original = getattr(error, "original", error)
+    log.error(
+        "/ping failed: %r",
+        original,
+        exc_info=(type(original), original, original.__traceback__),
+    )
+    message = "The Kat LFG alert failed. Check the Railway logs."
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+
 @bot.tree.command(name="rank", description="Show voice level and progress.")
 @app_commands.guild_only()
 @app_commands.describe(member="The member to view; leave blank for yourself")
@@ -1366,19 +1792,9 @@ async def rank(
         value=f"**{level}**  ·  `{superscript_number(level)}`",
         inline=True,
     )
-    multiplier = voice_xp_multiplier(target)
     embed.add_field(
-        name="Voice XP time",
+        name="Total voice time",
         value=f"**{format_duration(total)}**",
-        inline=True,
-    )
-    embed.add_field(
-        name="XP multiplier",
-        value=(
-            f"🚀 **{multiplier}× Server Booster**"
-            if multiplier > 1
-            else "⚪ **1× Standard**"
-        ),
         inline=True,
     )
     embed.add_field(
@@ -1416,7 +1832,6 @@ async def rank(
     embed.set_footer(
         text=(
             f"Voice counts every {TICK_SECONDS}s · "
-            f"Server Boosters earn {SERVER_BOOSTER_XP_MULTIPLIER}× XP · "
             f"Minimum humans in channel: {MIN_HUMANS_IN_VC}"
         )
     )
@@ -2005,8 +2420,7 @@ async def level_status(interaction: discord.Interaction) -> None:
         value=(
             f"At least **{MIN_HUMANS_IN_VC}** eligible human(s) in voice\n"
             f"Deafened users: **not counted**\n"
-            f"Muted users: **{'not counted' if REQUIRE_UNMUTED else 'counted'}**\n"
-            f"Server Booster role XP: **{SERVER_BOOSTER_XP_MULTIPLIER}× while assigned, 1× when removed**"
+            f"Muted users: **{'not counted' if REQUIRE_UNMUTED else 'counted'}**"
         ),
         inline=False,
     )
