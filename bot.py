@@ -542,24 +542,19 @@ def footer_guild_id(embed: discord.Embed) -> int | None:
     return int(match.group(1)) if match else None
 
 
-class AlertToggleView(discord.ui.View):
-    """Persistent mute/unmute button included in every Kat game-alert DM."""
+class NotifyMeButton(discord.ui.Button):
+    """Persistent green button that keeps Kat game alerts enabled."""
 
     def __init__(self, bot: "KatBot") -> None:
-        super().__init__(timeout=None)
+        super().__init__(
+            label="Notify Me Next Time",
+            style=discord.ButtonStyle.success,
+            emoji="🔔",
+            custom_id="katping:notify_next_time",
+        )
         self.bot = bot
 
-    @discord.ui.button(
-        label="Mute / unmute this server",
-        style=discord.ButtonStyle.secondary,
-        emoji="🔕",
-        custom_id="katping:toggle_server_alerts",
-    )
-    async def toggle_alerts(
-        self,
-        interaction: discord.Interaction,
-        _button: discord.ui.Button,
-    ) -> None:
+    async def callback(self, interaction: discord.Interaction) -> None:
         if interaction.message is None or not interaction.message.embeds:
             await interaction.response.send_message(
                 "I could not identify which server this alert came from."
@@ -573,34 +568,90 @@ class AlertToggleView(discord.ui.View):
             )
             return
 
-        existing = await self.bot.pool.fetchval(
-            "SELECT 1 FROM katping_opt_outs WHERE guild_id = $1 AND user_id = $2;",
+        await self.bot.pool.execute(
+            "DELETE FROM katping_opt_outs WHERE guild_id = $1 AND user_id = $2;",
             guild_id,
             interaction.user.id,
         )
+        await interaction.response.send_message(
+            "🔔 You will keep receiving Kat game alerts from this server."
+        )
 
-        if existing:
-            await self.bot.pool.execute(
-                "DELETE FROM katping_opt_outs WHERE guild_id = $1 AND user_id = $2;",
-                guild_id,
-                interaction.user.id,
-            )
+
+class MuteAlertsButton(discord.ui.Button):
+    """Persistent button that disables future Kat game alerts for a server."""
+
+    def __init__(self, bot: "KatBot") -> None:
+        super().__init__(
+            label="Mute Alerts",
+            style=discord.ButtonStyle.secondary,
+            emoji="🔕",
+            custom_id="katping:mute_alerts",
+        )
+        self.bot = bot
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.message is None or not interaction.message.embeds:
             await interaction.response.send_message(
-                "🔔 Kat game alerts from that server are enabled again."
+                "I could not identify which server this alert came from."
             )
-        else:
-            await self.bot.pool.execute(
-                """
-                INSERT INTO katping_opt_outs (guild_id, user_id)
-                VALUES ($1, $2)
-                ON CONFLICT (guild_id, user_id) DO NOTHING;
-                """,
-                guild_id,
-                interaction.user.id,
-            )
+            return
+
+        guild_id = footer_guild_id(interaction.message.embeds[0])
+        if guild_id is None:
             await interaction.response.send_message(
-                "🔕 Kat game alerts from that server are muted. Press the button again to unmute them."
+                "I could not identify which server this alert came from."
             )
+            return
+
+        await self.bot.pool.execute(
+            """
+            INSERT INTO katping_opt_outs (guild_id, user_id)
+            VALUES ($1, $2)
+            ON CONFLICT (guild_id, user_id) DO NOTHING;
+            """,
+            guild_id,
+            interaction.user.id,
+        )
+        await interaction.response.send_message(
+            "🔕 Kat game alerts from this server are now muted."
+        )
+
+
+class AlertToggleView(discord.ui.View):
+    """Game-alert buttons shown under each Kat DM."""
+
+    def __init__(
+        self,
+        bot: "KatBot",
+        *,
+        voice_url: str | None = None,
+        lfg_url: str | None = None,
+    ) -> None:
+        super().__init__(timeout=None)
+        self.bot = bot
+
+        if voice_url:
+            self.add_item(
+                discord.ui.Button(
+                    label="Join VC",
+                    style=discord.ButtonStyle.link,
+                    emoji="🔊",
+                    url=voice_url,
+                )
+            )
+        elif lfg_url:
+            self.add_item(
+                discord.ui.Button(
+                    label="Open LFG",
+                    style=discord.ButtonStyle.link,
+                    emoji="🎮",
+                    url=lfg_url,
+                )
+            )
+
+        self.add_item(NotifyMeButton(bot))
+        self.add_item(MuteAlertsButton(bot))
 
 
 class KatBot(commands.Bot):
@@ -1562,37 +1613,64 @@ def build_alert_embed(
 ) -> discord.Embed:
     safe_post = discord.utils.escape_markdown(context.post_name)
     safe_inviter = discord.utils.escape_markdown(inviter.display_name)
+    destination = " in VC" if voice_channel is not None else ""
 
     embed = discord.Embed(
-        title=f"🐱 {BOT_NAME} LFG alert",
+        title="🎮 Game alert!",
         url=context.jump_url,
         description=(
-            f"**{safe_inviter}** is inviting players to **{safe_post}**.\n\n"
-            f"The game name was copied automatically from the current LFG post."
+            f"**{safe_inviter}** started playing **{safe_post}** and is inviting "
+            f"you to join them{destination}!\n\n"
+            f"**LFG post:** [Open {safe_post}]({context.jump_url})"
         ),
-        color=discord.Color.from_rgb(237, 105, 168),
+        color=discord.Color.from_rgb(87, 242, 135),
         timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_author(
+        name=f"{BOT_NAME} • {guild.name}",
+        icon_url=inviter.display_avatar.url,
     )
 
     if voice_channel is not None:
         embed.add_field(
-            name="They are in voice",
-            value=f"{voice_channel.mention}\nOpen the server and join the channel.",
-            inline=False,
+            name="Voice channel",
+            value=(
+                f"[🔊 {discord.utils.escape_markdown(voice_channel.name)}]"
+                f"(https://discord.com/channels/{guild.id}/{voice_channel.id})"
+            ),
+            inline=True,
         )
 
     embed.add_field(
-        name="Open the LFG post",
-        value=f"[Join **{safe_post}**]({context.jump_url})",
-        inline=False,
+        name="Started by",
+        value=inviter.mention,
+        inline=True,
     )
-    embed.set_footer(text=f"{guild.name} • Guild ID: {guild.id}")
+    embed.set_footer(text=f"Use the buttons below to manage alerts • Guild ID: {guild.id}")
     return embed
 
 
-async def send_alert(member: discord.Member, embed: discord.Embed) -> bool:
+async def send_alert(
+    member: discord.Member,
+    embed: discord.Embed,
+    *,
+    context: LfgContext,
+    voice_channel: discord.VoiceChannel | None,
+) -> bool:
+    voice_url = (
+        f"https://discord.com/channels/{member.guild.id}/{voice_channel.id}"
+        if voice_channel is not None
+        else None
+    )
     try:
-        await member.send(embed=embed, view=AlertToggleView(bot))
+        await member.send(
+            embed=embed,
+            view=AlertToggleView(
+                bot,
+                voice_url=voice_url,
+                lfg_url=context.jump_url,
+            ),
+        )
         if DM_DELAY_SECONDS:
             await asyncio.sleep(DM_DELAY_SECONDS)
         return True
@@ -1707,7 +1785,12 @@ async def ping_command(interaction: discord.Interaction) -> None:
     delivered = 0
     failed = 0
     for member in recipients:
-        if await send_alert(member, embed):
+        if await send_alert(
+            member,
+            embed,
+            context=context,
+            voice_channel=voice_channel,
+        ):
             delivered += 1
         else:
             failed += 1
