@@ -539,12 +539,87 @@ def footer_guild_id(embed: discord.Embed) -> int | None:
     return int(match.group(1)) if match else None
 
 
-class ChannelNotificationButton(discord.ui.Button):
-    """Show members how to mute @here alerts for this Discord channel."""
+class FollowPostButton(discord.ui.Button):
+    """Add the clicking member to the current forum post/thread."""
 
     def __init__(self) -> None:
         super().__init__(
-            label="Turn Off Channel Alerts",
+            label="Notify Me / Follow Post",
+            style=discord.ButtonStyle.success,
+            emoji="🔔",
+            custom_id="katping:follow_post",
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        channel = interaction.channel
+        member = interaction.user
+
+        if not isinstance(channel, discord.Thread):
+            await interaction.response.send_message(
+                (
+                    "Automatic following works inside Discord forum posts and threads. "
+                    "For a normal text channel, right-click the channel and choose "
+                    "**Notification Settings** to enable notifications."
+                ),
+                ephemeral=True,
+            )
+            return
+
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message(
+                "This button only works inside a Discord server.",
+                ephemeral=True,
+            )
+            return
+
+        if channel.archived:
+            await interaction.response.send_message(
+                "This post is archived, so Discord will not let Kat add new followers.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            # Adding a member to a forum post's underlying thread makes Discord
+            # treat that member as following/joined to the post.
+            await channel.add_user(member)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                (
+                    "Kat could not make you follow this post. Give Kat **View Channel**, "
+                    "**Send Messages**, and **Send Messages in Threads** in the LFG forum."
+                ),
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException:
+            log.exception(
+                "Discord rejected follow request for user %s in thread %s",
+                member.id,
+                channel.id,
+            )
+            await interaction.response.send_message(
+                "Discord could not follow this post right now. Try again in a moment.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            (
+                f"🔔 You are now following **{channel.name}**. Discord will show the "
+                "post as **Following**, and notifications will use your personal "
+                "thread notification settings."
+            ),
+            ephemeral=True,
+        )
+
+
+class ChannelNotificationButton(discord.ui.Button):
+    """Unfollow a thread when possible, otherwise show channel-mute instructions."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            label="Turn Off Notifications",
             style=discord.ButtonStyle.secondary,
             emoji="🔕",
             custom_id="katping:channel_notification_help",
@@ -552,7 +627,35 @@ class ChannelNotificationButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         channel = interaction.channel
+        member = interaction.user
         channel_name = getattr(channel, "name", "this channel")
+
+        if isinstance(channel, discord.Thread) and isinstance(member, discord.Member):
+            me = channel.guild.me
+            can_remove = (
+                me is not None
+                and channel.permissions_for(me).manage_threads
+                and not channel.archived
+            )
+            if can_remove:
+                try:
+                    await channel.remove_user(member)
+                except discord.NotFound:
+                    # The member was already not following the post.
+                    pass
+                except (discord.Forbidden, discord.HTTPException):
+                    log.exception(
+                        "Could not remove user %s from thread %s",
+                        member.id,
+                        channel.id,
+                    )
+                else:
+                    await interaction.response.send_message(
+                        f"🔕 You are no longer following **{channel.name}**.",
+                        ephemeral=True,
+                    )
+                    return
+
         await interaction.response.send_message(
             (
                 f"To stop `@here` alerts from **#{channel_name}**, use Discord's "
@@ -561,8 +664,9 @@ class ChannelNotificationButton(discord.ui.Button):
                 "**Notification Settings** → **Nothing**, or choose **Mute Channel**.\n"
                 "**Mobile:** Press and hold the channel or post → "
                 "**Notifications** → **Nothing**, or mute it.\n\n"
-                "Discord does not allow bots to change your personal channel "
-                "notification settings automatically."
+                "For one-click unfollowing, give Kat the **Manage Threads** permission. "
+                "Discord still does not allow bots to change your personal notification "
+                "level directly."
             ),
             ephemeral=True,
         )
@@ -598,6 +702,7 @@ class ChannelAlertView(discord.ui.View):
                 )
             )
 
+        self.add_item(FollowPostButton())
         self.add_item(ChannelNotificationButton())
 
 
@@ -642,7 +747,7 @@ class KatBot(commands.Bot):
                 )
                 await asyncio.sleep(delay)
 
-        # Keep the channel-notification help button active after Railway restarts.
+        # Keep the follow and notification buttons active after Railway restarts.
         self.add_view(ChannelAlertView())
 
         if TEST_GUILD_ID:
@@ -1586,7 +1691,7 @@ def build_alert_embed(
         value=inviter.mention,
         inline=True,
     )
-    embed.set_footer(text="Use the button below for channel notification instructions")
+    embed.set_footer(text="Use the buttons below to follow or mute this LFG post")
     return embed
 
 
