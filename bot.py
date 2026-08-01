@@ -2895,37 +2895,6 @@ async def role_settings_panel_error(
         await interaction.response.send_message(message, ephemeral=True)
 
 
-@bot.tree.command(
-    name="gamepanel",
-    description="Post the self-assignable game notification role panel.",
-)
-@app_commands.guild_only()
-@app_commands.checks.has_permissions(manage_guild=True)
-async def game_panel(interaction: discord.Interaction) -> None:
-    assert interaction.guild is not None
-    rows = await fetch_game_role_rows(bot.pool, interaction.guild.id)
-    embed = build_game_roles_panel_embed(interaction.guild, len(rows))
-    await interaction.response.send_message(
-        embed=embed,
-        view=GameRolesPanelView(bot),
-    )
-
-
-@game_panel.error
-async def game_panel_error(
-    interaction: discord.Interaction,
-    error: app_commands.AppCommandError,
-) -> None:
-    if isinstance(error, app_commands.MissingPermissions):
-        message = "Only administrators with **Manage Server** can post this panel."
-    else:
-        log.exception("/gamepanel failed", exc_info=error)
-        message = "The game-role panel could not be posted. Check the Railway logs."
-    if interaction.response.is_done():
-        await interaction.followup.send(message, ephemeral=True)
-    else:
-        await interaction.response.send_message(message, ephemeral=True)
-
 
 game_admin_group = app_commands.Group(
     name="gameadmin",
