@@ -1123,6 +1123,412 @@ class GameRolesPanelView(discord.ui.View):
         )
 
 
+def build_role_settings_panel_embed(guild: discord.Guild) -> discord.Embed:
+    embed = discord.Embed(
+        title="ROLES & SETTINGS",
+        description=(
+            "A clean control panel for your alerts, nickname badge, and voice "
+            "level setup. Every button opens privately just for you."
+        ),
+        color=discord.Color.from_rgb(88, 101, 242),
+    )
+    embed.add_field(
+        name="🎮 Game Alerts",
+        value="Pick the game roles you want notifications for.",
+        inline=False,
+    )
+    embed.add_field(
+        name="💎 Badge Vault",
+        value="Choose the emoji shown before your nickname.",
+        inline=False,
+    )
+    embed.add_field(
+        name="⚡ Auto Upgrade",
+        value="Toggle automatic badge upgrades on or off.",
+        inline=False,
+    )
+    embed.add_field(
+        name="🪪 Nickname Card",
+        value="See your level, voice time, badge, and current nickname.",
+        inline=False,
+    )
+    embed.set_footer(text="Public panel • Private actions")
+    if guild.icon is not None:
+        embed.set_thumbnail(url=guild.icon.url)
+    return embed
+
+
+def badge_mode_label(saved_selection: str) -> str:
+    selection = (saved_selection or "").strip()
+    if selection == "":
+        return "Auto"
+    if selection == NO_EMOJI_SELECTION:
+        return "Hidden"
+    return "Manual"
+
+
+class BadgeVaultSelect(discord.ui.Select):
+    def __init__(self, vault: "BadgeVaultView") -> None:
+        self.vault = vault
+        options: list[discord.SelectOption] = []
+        current = vault.display_badge
+        for required_level, emoji, _nickname_badge in vault.unlocked_badges[:25]:
+            label = f"Level {required_level}"
+            description = "Currently equipped" if emoji == current else "Unlocked badge"
+            options.append(
+                discord.SelectOption(
+                    label=label,
+                    value=emoji,
+                    emoji=emoji,
+                    description=description,
+                    default=emoji == current,
+                )
+            )
+        super().__init__(
+            placeholder="Choose a nickname badge",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not self.values:
+            await interaction.response.defer()
+            return
+        badge = self.values[0]
+        await self.vault.set_selected_badge(interaction, badge)
+
+
+class BadgeVaultAutoButton(discord.ui.Button):
+    def __init__(self, vault: "BadgeVaultView") -> None:
+        self.vault = vault
+        enabled = (vault.saved_selection or "").strip() == ""
+        super().__init__(
+            label="Auto On" if enabled else "Use Auto",
+            style=discord.ButtonStyle.primary if enabled else discord.ButtonStyle.secondary,
+            emoji="⚡",
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.vault.enable_auto(interaction)
+
+
+class BadgeVaultHideButton(discord.ui.Button):
+    def __init__(self, vault: "BadgeVaultView") -> None:
+        self.vault = vault
+        hidden = (vault.saved_selection or "").strip() == NO_EMOJI_SELECTION
+        super().__init__(
+            label="Hidden" if hidden else "Hide Badge",
+            style=discord.ButtonStyle.danger if hidden else discord.ButtonStyle.secondary,
+            emoji="🚫",
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.vault.hide_badge(interaction)
+
+
+class BadgeVaultView(discord.ui.View):
+    def __init__(self, bot: "KatBot", guild: discord.Guild, member: discord.Member) -> None:
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.guild = guild
+        self.member = member
+        self.total_seconds = 0
+        self.level = 0
+        self.unlocks: tuple[EmojiUnlock, ...] = ()
+        self.unlocked_badges: list[EmojiUnlock] = []
+        self.saved_selection = ""
+        self.display_badge = ""
+
+    async def refresh(self) -> None:
+        row = await self.bot.get_or_create_stats(self.guild.id, self.member.id)
+        self.total_seconds = int(row["total_voice_seconds"])
+        self.level = level_from_total_seconds(self.total_seconds)
+        self.unlocks = await self.bot.get_emoji_unlocks(self.guild.id)
+        self.unlocked_badges = list(unlocked_emojis(self.level, self.unlocks))
+        self.saved_selection = str(row["selected_emoji"] or "")
+        self.display_badge = valid_selected_emoji(
+            self.saved_selection,
+            self.level,
+            self.unlocks,
+        )
+        self.clear_items()
+        if self.unlocked_badges:
+            self.add_item(BadgeVaultSelect(self))
+        self.add_item(BadgeVaultAutoButton(self))
+        self.add_item(BadgeVaultHideButton(self))
+
+    def build_embed(self, *, note: str | None = None) -> discord.Embed:
+        current = self.display_badge or "None"
+        unlocked = " ".join(emoji for _lvl, emoji, _nickname_badge in self.unlocked_badges) or "None yet"
+        next_unlock = next_emoji_unlock(self.level, self.unlocks)
+        embed = discord.Embed(
+            title="BADGE VAULT",
+            description="Pick the emoji shown before your nickname.",
+            color=discord.Color.from_rgb(87, 242, 135),
+        )
+        embed.add_field(name="Current", value=current, inline=True)
+        embed.add_field(name="Mode", value=badge_mode_label(self.saved_selection), inline=True)
+        embed.add_field(name="Level", value=f"{self.level}", inline=True)
+        embed.add_field(name="Unlocked", value=unlocked, inline=False)
+        if next_unlock is not None:
+            embed.add_field(
+                name="Next unlock",
+                value=f"{next_unlock[1]} at **Level {next_unlock[0]}**",
+                inline=False,
+            )
+        embed.add_field(
+            name="Nickname Preview",
+            value=f"`{nickname_with_level(self.member, self.level, self.saved_selection, self.unlocks)}`",
+            inline=False,
+        )
+        if note:
+            embed.set_footer(text=note)
+        else:
+            embed.set_footer(text="Private menu • Choose a badge, use auto, or hide it")
+        return embed
+
+    async def set_selected_badge(self, interaction: discord.Interaction, badge: str) -> None:
+        await self.bot.pool.execute(
+            "UPDATE voice_levels SET selected_emoji = $1 WHERE guild_id = $2 AND user_id = $3;",
+            badge,
+            self.guild.id,
+            self.member.id,
+        )
+        await self.bot.apply_level_nickname(self.member, self.level, badge)
+        await self.bot.mark_nickname_synced(self.guild.id, self.member.id, self.level)
+        await self.refresh()
+        await interaction.response.edit_message(
+            embed=self.build_embed(note=f"Equipped {badge}."),
+            view=self,
+        )
+
+    async def enable_auto(self, interaction: discord.Interaction) -> None:
+        await self.bot.pool.execute(
+            "UPDATE voice_levels SET selected_emoji = $1 WHERE guild_id = $2 AND user_id = $3;",
+            "",
+            self.guild.id,
+            self.member.id,
+        )
+        await self.bot.apply_level_nickname(self.member, self.level, "")
+        await self.bot.mark_nickname_synced(self.guild.id, self.member.id, self.level)
+        await self.refresh()
+        await interaction.response.edit_message(
+            embed=self.build_embed(note="Auto upgrade is now enabled."),
+            view=self,
+        )
+
+    async def hide_badge(self, interaction: discord.Interaction) -> None:
+        await self.bot.pool.execute(
+            "UPDATE voice_levels SET selected_emoji = $1 WHERE guild_id = $2 AND user_id = $3;",
+            NO_EMOJI_SELECTION,
+            self.guild.id,
+            self.member.id,
+        )
+        await self.bot.apply_level_nickname(self.member, self.level, NO_EMOJI_SELECTION)
+        await self.bot.mark_nickname_synced(self.guild.id, self.member.id, self.level)
+        await self.refresh()
+        await interaction.response.edit_message(
+            embed=self.build_embed(note="Your nickname badge is now hidden."),
+            view=self,
+        )
+
+
+async def build_nickname_card_embed(bot: "KatBot", member: discord.Member) -> discord.Embed:
+    row = await bot.get_or_create_stats(member.guild.id, member.id)
+    total = int(row["total_voice_seconds"])
+    level, progress, required = progress_for_total(total)
+    remaining = max(0, required - progress)
+    unlocks = await bot.get_emoji_unlocks(member.guild.id)
+    saved_selection = str(row["selected_emoji"] or "")
+    display_emoji = valid_selected_emoji(saved_selection, level, unlocks)
+    next_unlock = next_emoji_unlock(level, unlocks)
+
+    embed = discord.Embed(
+        title="NICKNAME CARD",
+        description="A quick look at your voice level nickname setup.",
+        color=discord.Color.from_rgb(88, 101, 242),
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Level", value=f"**{level}** `{superscript_number(level)}`", inline=True)
+    embed.add_field(name="Voice Time", value=f"**{format_duration(total)}**", inline=True)
+    embed.add_field(name="Badge", value=display_emoji or "None", inline=True)
+    embed.add_field(
+        name="Mode",
+        value=badge_mode_label(saved_selection),
+        inline=True,
+    )
+    embed.add_field(
+        name="Current Nickname",
+        value=f"`{nickname_with_level(member, level, saved_selection, unlocks)}`",
+        inline=False,
+    )
+    embed.add_field(
+        name=f"Progress to Level {level + 1}",
+        value=(
+            f"`{progress_bar(progress, required)}`\n"
+            f"**{format_duration(progress)}** / {format_duration(required)}\n"
+            f"**{format_duration(remaining)} remaining**"
+        ),
+        inline=False,
+    )
+    if next_unlock is not None:
+        embed.add_field(
+            name="Next unlock",
+            value=f"{next_unlock[1]} at **Level {next_unlock[0]}**",
+            inline=False,
+        )
+    embed.set_footer(text="Private card")
+    return embed
+
+
+class RoleSettingsPanelView(discord.ui.View):
+    def __init__(self, bot: "KatBot") -> None:
+        super().__init__(timeout=None)
+        self.bot = bot
+
+    @discord.ui.button(
+        label="Game Roles",
+        style=discord.ButtonStyle.success,
+        emoji="🎮",
+        custom_id="kat:role_settings_game_roles",
+        row=0,
+    )
+    async def open_game_roles(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        guild = interaction.guild
+        member = interaction.user
+        if guild is None or not isinstance(member, discord.Member):
+            await interaction.response.send_message(
+                "This panel only works inside a Discord server.",
+                ephemeral=True,
+            )
+            return
+
+        rows = await fetch_game_role_rows(self.bot.pool, guild.id)
+        valid_rows = [row for row in rows if guild.get_role(int(row["role_id"])) is not None]
+        if not valid_rows:
+            await interaction.response.send_message(
+                "No game notification roles are configured yet.",
+                ephemeral=True,
+            )
+            return
+
+        picker = GameRolePickerView(self.bot, guild, member, valid_rows)
+        await interaction.response.send_message(
+            picker.content(),
+            view=picker,
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Badge Vault",
+        style=discord.ButtonStyle.success,
+        emoji="💎",
+        custom_id="kat:role_settings_badges",
+        row=0,
+    )
+    async def open_badge_vault(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        guild = interaction.guild
+        member = interaction.user
+        if guild is None or not isinstance(member, discord.Member):
+            await interaction.response.send_message(
+                "This panel only works inside a Discord server.",
+                ephemeral=True,
+            )
+            return
+
+        view = BadgeVaultView(self.bot, guild, member)
+        await view.refresh()
+        await interaction.response.send_message(
+            embed=view.build_embed(),
+            view=view,
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Auto Upgrade",
+        style=discord.ButtonStyle.primary,
+        emoji="⚡",
+        custom_id="kat:role_settings_auto",
+        row=1,
+    )
+    async def toggle_auto_upgrade(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        guild = interaction.guild
+        member = interaction.user
+        if guild is None or not isinstance(member, discord.Member):
+            await interaction.response.send_message(
+                "This panel only works inside a Discord server.",
+                ephemeral=True,
+            )
+            return
+
+        row = await self.bot.get_or_create_stats(guild.id, member.id)
+        total = int(row["total_voice_seconds"])
+        level = level_from_total_seconds(total)
+        unlocks = await self.bot.get_emoji_unlocks(guild.id)
+        saved_selection = str(row["selected_emoji"] or "")
+        current_badge = valid_selected_emoji(saved_selection, level, unlocks)
+
+        if saved_selection.strip() == "":
+            new_selection = current_badge or NO_EMOJI_SELECTION
+            message = (
+                f"Auto upgrade is now **off**. "
+                f"{current_badge + ' has' if current_badge else 'No badge has'} been locked in."
+            )
+        else:
+            new_selection = ""
+            message = "Auto upgrade is now **on**. Your highest unlocked badge will be used."
+
+        await self.bot.pool.execute(
+            "UPDATE voice_levels SET selected_emoji = $1 WHERE guild_id = $2 AND user_id = $3;",
+            new_selection,
+            guild.id,
+            member.id,
+        )
+        await self.bot.apply_level_nickname(member, level, new_selection)
+        await self.bot.mark_nickname_synced(guild.id, member.id, level)
+        await interaction.response.send_message(message, ephemeral=True)
+
+    @discord.ui.button(
+        label="Nickname Card",
+        style=discord.ButtonStyle.secondary,
+        emoji="🪪",
+        custom_id="kat:role_settings_card",
+        row=1,
+    )
+    async def view_nickname_card(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        guild = interaction.guild
+        member = interaction.user
+        if guild is None or not isinstance(member, discord.Member):
+            await interaction.response.send_message(
+                "This panel only works inside a Discord server.",
+                ephemeral=True,
+            )
+            return
+
+        embed = await build_nickname_card_embed(self.bot, member)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 class ChannelAlertView(discord.ui.View):
     """Buttons shown under each public @here game alert."""
 
@@ -1202,6 +1608,7 @@ class KatBot(commands.Bot):
         # Keep public buttons active after Railway restarts.
         self.add_view(ChannelAlertView())
         self.add_view(GameRolesPanelView(self))
+        self.add_view(RoleSettingsPanelView(self))
 
         if TEST_GUILD_ID:
             guild = discord.Object(id=TEST_GUILD_ID)
@@ -2455,6 +2862,37 @@ async def ping_command_error(
         await interaction.response.send_message(message, ephemeral=True)
 
 
+
+
+@bot.tree.command(
+    name="rolesettingspanel",
+    description="Post the public member role and nickname settings panel.",
+)
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(manage_guild=True)
+async def role_settings_panel(interaction: discord.Interaction) -> None:
+    assert interaction.guild is not None
+    embed = build_role_settings_panel_embed(interaction.guild)
+    await interaction.response.send_message(
+        embed=embed,
+        view=RoleSettingsPanelView(bot),
+    )
+
+
+@role_settings_panel.error
+async def role_settings_panel_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+) -> None:
+    if isinstance(error, app_commands.MissingPermissions):
+        message = "Only administrators with **Manage Server** can post this panel."
+    else:
+        log.exception("/rolesettingspanel failed", exc_info=error)
+        message = "The role settings panel could not be posted. Check the Railway logs."
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
 
 
 @bot.tree.command(
