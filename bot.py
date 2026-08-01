@@ -75,10 +75,15 @@ MIN_HUMANS_IN_VC = max(1, int(os.getenv("MIN_HUMANS_IN_VC", "1")))
 REQUIRE_UNMUTED = env_flag("REQUIRE_UNMUTED", default=False)
 SYNC_NICKNAMES_ON_START = env_flag("SYNC_NICKNAMES_ON_START", default=True)
 
-# Kat LFG alert settings. /ping posts an @here alert in the current LFG post.
+# Kat game-alert settings. /ping works in any text channel or thread whose
+# name matches a game configured through /gameadmin.
 PINGER_ROLE_ID = env_int("PINGER_ROLE_ID", 0)
+# Kept as an optional legacy variable so existing Railway setups do not break.
+# It no longer limits where /ping can be used.
 LFG_CHANNEL_IDS = parse_id_list(os.getenv("LFG_CHANNEL_IDS", ""))
 COOLDOWN_MINUTES = max(0, env_int("COOLDOWN_MINUTES", 15))
+MAX_RECIPIENTS = max(1, env_int("MAX_RECIPIENTS", 500))
+DM_DELAY_SECONDS = max(0.0, env_float("DM_DELAY_SECONDS", 0.20))
 BOT_NAME = os.getenv("BOT_NAME", "Kat").strip() or "Kat"
 
 # Default Unicode badge entries. These seed each server's database.
@@ -234,6 +239,22 @@ CREATE TABLE IF NOT EXISTS katping_ping_log (
 
 CREATE INDEX IF NOT EXISTS katping_ping_log_guild_created_idx
 ON katping_ping_log (guild_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS game_notification_roles (
+    guild_id BIGINT NOT NULL,
+    game_key TEXT NOT NULL,
+    game_name TEXT NOT NULL,
+    role_id BIGINT NOT NULL,
+    emoji TEXT NOT NULL DEFAULT '🎮',
+    created_by BIGINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (guild_id, game_key),
+    UNIQUE (guild_id, role_id)
+);
+
+CREATE INDEX IF NOT EXISTS game_notification_roles_guild_name_idx
+ON game_notification_roles (guild_id, game_name);
 """
 
 UPSERT_ACTIVE_SQL = """
@@ -672,6 +693,436 @@ class ChannelNotificationButton(discord.ui.Button):
         )
 
 
+
+
+PRIVILEGED_ROLE_PERMISSION_NAMES = (
+    "administrator",
+    "manage_guild",
+    "manage_roles",
+    "manage_channels",
+    "kick_members",
+    "ban_members",
+    "moderate_members",
+    "manage_messages",
+    "mention_everyone",
+    "manage_webhooks",
+    "manage_threads",
+)
+
+
+def normalize_game_key(name: str) -> str:
+    """Create a stable key so post names match configured games."""
+    normalized = re.sub(r"[^a-z0-9]+", " ", name.casefold()).strip()
+    return re.sub(r"\s+", " ", normalized)
+
+
+def role_has_privileged_permissions(role: discord.Role) -> bool:
+    permissions = role.permissions
+    return any(getattr(permissions, name, False) for name in PRIVILEGED_ROLE_PERMISSION_NAMES)
+
+
+async def fetch_game_role_rows(
+    pool: asyncpg.Pool,
+    guild_id: int,
+) -> list[asyncpg.Record]:
+    rows = await pool.fetch(
+        """
+        SELECT game_key, game_name, role_id, emoji
+        FROM game_notification_roles
+        WHERE guild_id = $1
+        ORDER BY LOWER(game_name), role_id;
+        """,
+        guild_id,
+    )
+    return list(rows)
+
+
+async def find_game_notification_role(
+    pool: asyncpg.Pool,
+    guild: discord.Guild,
+    post_name: str,
+) -> tuple[discord.Role | None, str | None]:
+    game_key = normalize_game_key(post_name)
+    if not game_key:
+        return None, None
+
+    row = await pool.fetchrow(
+        """
+        SELECT game_name, role_id
+        FROM game_notification_roles
+        WHERE guild_id = $1 AND game_key = $2;
+        """,
+        guild.id,
+        game_key,
+    )
+    if row is None:
+        return None, None
+
+    role = guild.get_role(int(row["role_id"]))
+    if role is None:
+        return None, str(row["game_name"])
+    return role, str(row["game_name"])
+
+
+def build_game_roles_panel_embed(
+    guild: discord.Guild,
+    configured_count: int,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title="ROLES & GAME ALERTS",
+        description=(
+            "Choose the games you want notifications for. Your selections are "
+            "private, and you can change them whenever you want."
+        ),
+        color=discord.Color.from_rgb(87, 242, 135),
+    )
+    embed.add_field(
+        name="🎮 PICK YOUR GAMES",
+        value=(
+            "Press **Choose Game Roles**, then tap a game button to turn its "
+            "notification role on or off. Green buttons are currently selected."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🔔 GAME-SPECIFIC ALERTS",
+        value=(
+            "Use `/ping` in any text channel, forum post, or thread whose name "
+            "matches a configured game. Kat uses `@here` for active members and "
+            "DMs subscribed members who were not already covered by `@here`."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🛡️ ADMIN CONTROL",
+        value=(
+            "Only administrators can add games, connect roles, remove games, or "
+            "post a new panel."
+        ),
+        inline=False,
+    )
+    embed.set_footer(
+        text=f"{configured_count} game role(s) configured • Private role selection"
+    )
+    if guild.icon is not None:
+        embed.set_thumbnail(url=guild.icon.url)
+    return embed
+
+
+GAME_ROLES_PER_PAGE = 20
+
+
+def safe_component_emoji(value: str) -> str:
+    """Return a safe standard emoji for Discord component buttons."""
+    emoji = (value or "").strip()
+    if not emoji or len(emoji) > 8 or is_custom_emoji_code(emoji):
+        return "🎮"
+    return emoji
+
+
+class GameRoleToggleButton(discord.ui.Button):
+    def __init__(
+        self,
+        picker: "GameRolePickerView",
+        row_data: asyncpg.Record,
+        *,
+        button_row: int,
+    ) -> None:
+        self.picker = picker
+        self.role_id = int(row_data["role_id"])
+        self.game_name = str(row_data["game_name"])
+        selected = self.role_id in picker.selected_role_ids
+        super().__init__(
+            label=self.game_name[:80],
+            style=(
+                discord.ButtonStyle.success
+                if selected
+                else discord.ButtonStyle.secondary
+            ),
+            emoji=safe_component_emoji(str(row_data["emoji"] or "🎮")),
+            custom_id=f"kat:toggle_game_role:{self.role_id}",
+            row=button_row,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.picker.toggle_role(interaction, self.role_id, self.game_name)
+
+
+class GameRolePageButton(discord.ui.Button):
+    def __init__(
+        self,
+        picker: "GameRolePickerView",
+        *,
+        direction: int,
+    ) -> None:
+        self.picker = picker
+        self.direction = direction
+        previous = direction < 0
+        super().__init__(
+            label="Previous Page" if previous else "Next Page",
+            style=discord.ButtonStyle.primary,
+            emoji="◀️" if previous else "▶️",
+            custom_id=(
+                "kat:game_roles_previous_page"
+                if previous
+                else "kat:game_roles_next_page"
+            ),
+            disabled=(
+                picker.page <= 0
+                if previous
+                else picker.page >= picker.page_count - 1
+            ),
+            row=4,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.picker.change_page(interaction, self.direction)
+
+
+class GameRoleDoneButton(discord.ui.Button):
+    def __init__(self, picker: "GameRolePickerView") -> None:
+        self.picker = picker
+        super().__init__(
+            label="Done",
+            style=discord.ButtonStyle.success,
+            emoji="✅",
+            custom_id="kat:game_roles_done",
+            row=4,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.picker.finish(interaction)
+
+
+class GameRolePickerView(discord.ui.View):
+    """Private paginated role buttons, similar to a Discord game picker."""
+
+    def __init__(
+        self,
+        bot: "KatBot",
+        guild: discord.Guild,
+        member: discord.Member,
+        rows: list[asyncpg.Record],
+        *,
+        page: int = 0,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.guild_id = guild.id
+        self.member_id = member.id
+        self.rows = rows
+        self.page_count = max(1, math.ceil(len(rows) / GAME_ROLES_PER_PAGE))
+        self.page = max(0, min(page, self.page_count - 1))
+        self.selected_role_ids = {role.id for role in member.roles}
+        self.rebuild_items()
+
+    def content(self, status: str | None = None) -> str:
+        selected_count = sum(
+            1 for row in self.rows if int(row["role_id"]) in self.selected_role_ids
+        )
+        lines = [
+            "**Choose the games you want notifications for.**",
+            "Green = selected • Gray = not selected",
+            f"Page **{self.page + 1}/{self.page_count}** • Selected **{selected_count}**",
+        ]
+        if status:
+            lines.append(f"\n{status}")
+        return "\n".join(lines)
+
+    def rebuild_items(self) -> None:
+        self.clear_items()
+        start = self.page * GAME_ROLES_PER_PAGE
+        page_rows = self.rows[start : start + GAME_ROLES_PER_PAGE]
+        for index, row_data in enumerate(page_rows):
+            self.add_item(
+                GameRoleToggleButton(
+                    self,
+                    row_data,
+                    button_row=index // 5,
+                )
+            )
+
+        self.add_item(GameRolePageButton(self, direction=-1))
+        self.add_item(
+            discord.ui.Button(
+                label=f"{self.page + 1}/{self.page_count}",
+                style=discord.ButtonStyle.secondary,
+                disabled=True,
+                custom_id="kat:game_roles_page_number",
+                row=4,
+            )
+        )
+        self.add_item(GameRolePageButton(self, direction=1))
+        self.add_item(GameRoleDoneButton(self))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.member_id:
+            return True
+        await interaction.response.send_message(
+            "Open the game-role panel yourself to change your roles.",
+            ephemeral=True,
+        )
+        return False
+
+    async def toggle_role(
+        self,
+        interaction: discord.Interaction,
+        role_id: int,
+        game_name: str,
+    ) -> None:
+        guild = interaction.guild
+        member = interaction.user
+        if guild is None or not isinstance(member, discord.Member):
+            await interaction.response.send_message(
+                "This menu only works inside a Discord server.",
+                ephemeral=True,
+            )
+            return
+
+        me = guild.me
+        role = guild.get_role(role_id)
+        if role is None:
+            self.rows = [row for row in self.rows if int(row["role_id"]) != role_id]
+            self.page_count = max(
+                1,
+                math.ceil(len(self.rows) / GAME_ROLES_PER_PAGE),
+            )
+            self.page = min(self.page, self.page_count - 1)
+            self.rebuild_items()
+            await interaction.response.edit_message(
+                content=self.content("That game's Discord role no longer exists."),
+                view=self,
+            )
+            return
+
+        if me is None or not me.guild_permissions.manage_roles:
+            await interaction.response.send_message(
+                "Kat needs **Manage Roles** before it can update game roles.",
+                ephemeral=True,
+            )
+            return
+        if role.managed or role >= me.top_role or role_has_privileged_permissions(role):
+            await interaction.response.send_message(
+                "Kat cannot safely assign that role. Move Kat above it and make sure "
+                "the role has no staff or moderation permissions.",
+                ephemeral=True,
+            )
+            return
+
+        selected = role_id in self.selected_role_ids
+        try:
+            if selected:
+                await member.remove_roles(
+                    role,
+                    reason="Member disabled a Kat game notification role",
+                )
+                self.selected_role_ids.discard(role_id)
+                status = f"Removed {role.mention} for **{game_name}**."
+            else:
+                await member.add_roles(
+                    role,
+                    reason="Member enabled a Kat game notification role",
+                )
+                self.selected_role_ids.add(role_id)
+                status = f"Added {role.mention} for **{game_name}**."
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "Kat could not update that role. Keep **Manage Roles** enabled and "
+                "move Kat's role above every game notification role.",
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException:
+            log.exception(
+                "Discord rejected a game-role update for member %s and role %s",
+                member.id,
+                role_id,
+            )
+            await interaction.response.send_message(
+                "Discord could not update that game role right now.",
+                ephemeral=True,
+            )
+            return
+
+        self.rebuild_items()
+        await interaction.response.edit_message(
+            content=self.content(status),
+            view=self,
+        )
+
+    async def change_page(
+        self,
+        interaction: discord.Interaction,
+        direction: int,
+    ) -> None:
+        self.page = max(0, min(self.page + direction, self.page_count - 1))
+        self.rebuild_items()
+        await interaction.response.edit_message(
+            content=self.content(),
+            view=self,
+        )
+
+    async def finish(self, interaction: discord.Interaction) -> None:
+        selected_count = sum(
+            1 for row in self.rows if int(row["role_id"]) in self.selected_role_ids
+        )
+        await interaction.response.edit_message(
+            content=(
+                f"✅ Saved. You currently have **{selected_count}** game notification "
+                "role(s). Open the panel again whenever you want to change them."
+            ),
+            view=None,
+        )
+        self.stop()
+
+
+class GameRolesPanelView(discord.ui.View):
+    """Persistent public panel; each member opens a private paginated picker."""
+
+    def __init__(self, bot: "KatBot") -> None:
+        super().__init__(timeout=None)
+        self.bot = bot
+
+    @discord.ui.button(
+        label="Choose Game Roles",
+        style=discord.ButtonStyle.success,
+        emoji="🎮",
+        custom_id="kat:open_game_roles",
+    )
+    async def open_game_roles(
+        self,
+        interaction: discord.Interaction,
+        _button: discord.ui.Button,
+    ) -> None:
+        guild = interaction.guild
+        member = interaction.user
+        if guild is None or not isinstance(member, discord.Member):
+            await interaction.response.send_message(
+                "This panel only works inside a Discord server.",
+                ephemeral=True,
+            )
+            return
+
+        rows = await fetch_game_role_rows(self.bot.pool, guild.id)
+        valid_rows = [
+            row for row in rows if guild.get_role(int(row["role_id"])) is not None
+        ]
+        if not valid_rows:
+            await interaction.response.send_message(
+                "No game notification roles are configured yet. An administrator can "
+                "add one with `/gameadmin add` or `/gameadmin create`.",
+                ephemeral=True,
+            )
+            return
+
+        picker = GameRolePickerView(self.bot, guild, member, valid_rows)
+        await interaction.response.send_message(
+            picker.content(),
+            view=picker,
+            ephemeral=True,
+        )
+
+
 class ChannelAlertView(discord.ui.View):
     """Buttons shown under each public @here game alert."""
 
@@ -713,6 +1164,7 @@ class KatBot(commands.Bot):
         intents = discord.Intents.none()
         intents.guilds = True
         intents.members = True
+        intents.presences = True
         intents.voice_states = True
 
         super().__init__(command_prefix=commands.when_mentioned, intents=intents)
@@ -747,8 +1199,9 @@ class KatBot(commands.Bot):
                 )
                 await asyncio.sleep(delay)
 
-        # Keep the follow and notification buttons active after Railway restarts.
+        # Keep public buttons active after Railway restarts.
         self.add_view(ChannelAlertView())
+        self.add_view(GameRolesPanelView(self))
 
         if TEST_GUILD_ID:
             guild = discord.Object(id=TEST_GUILD_ID)
@@ -1649,6 +2102,110 @@ def format_wait(seconds: int) -> str:
     return f"{secs}s"
 
 
+def member_is_covered_by_here(
+    member: discord.Member,
+    channel: discord.TextChannel | discord.Thread,
+) -> bool:
+    """Best-effort check for whether Discord's @here should already alert a member."""
+    if member.status == discord.Status.offline:
+        return False
+    return channel.permissions_for(member).view_channel
+
+
+def build_game_dm_content(
+    *,
+    inviter: discord.Member,
+    game_name: str,
+    context: LfgContext,
+    voice_channel: discord.VoiceChannel | None,
+) -> str:
+    safe_game = discord.utils.escape_markdown(game_name)
+    safe_post = discord.utils.escape_markdown(context.post_name)
+
+    if voice_channel is not None:
+        voice_url = (
+            f"https://discord.com/channels/{inviter.guild.id}/{voice_channel.id}"
+        )
+        safe_voice = discord.utils.escape_markdown(voice_channel.name)
+        call_line = f"**Join them here:** [🔊 {safe_voice}]({voice_url})"
+    else:
+        call_line = "**Call location:** They are not in a voice channel yet."
+
+    return (
+        f"{inviter.mention} is inviting you to play **{safe_game}**!\n\n"
+        f"{call_line}\n"
+        f"**Game post:** [# {safe_post}]({context.jump_url})\n\n"
+        "**NOTE:** Most people wait until they see activity in VC before joining. "
+        "Be one of the first to hop in and help the lobby grow!\n"
+        "To stop these DMs, remove this game's role from the Kat game-role panel."
+    )
+
+
+def build_game_dm_view(
+    *,
+    context: LfgContext,
+    guild_id: int,
+    voice_channel: discord.VoiceChannel | None,
+) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    if voice_channel is not None:
+        view.add_item(
+            discord.ui.Button(
+                label="Join VC",
+                style=discord.ButtonStyle.link,
+                emoji="🔊",
+                url=f"https://discord.com/channels/{guild_id}/{voice_channel.id}",
+            )
+        )
+    view.add_item(
+        discord.ui.Button(
+            label="Open Game Post",
+            style=discord.ButtonStyle.link,
+            emoji="🎮",
+            url=context.jump_url,
+        )
+    )
+    return view
+
+
+async def send_game_dm(
+    member: discord.Member,
+    *,
+    inviter: discord.Member,
+    game_name: str,
+    context: LfgContext,
+    voice_channel: discord.VoiceChannel | None,
+) -> bool:
+    try:
+        await member.send(
+            content=build_game_dm_content(
+                inviter=inviter,
+                game_name=game_name,
+                context=context,
+                voice_channel=voice_channel,
+            ),
+            view=build_game_dm_view(
+                context=context,
+                guild_id=inviter.guild.id,
+                voice_channel=voice_channel,
+            ),
+            allowed_mentions=discord.AllowedMentions(
+                everyone=False,
+                roles=False,
+                users=[inviter],
+                replied_user=False,
+            ),
+        )
+        if DM_DELAY_SECONDS:
+            await asyncio.sleep(DM_DELAY_SECONDS)
+        return True
+    except (discord.Forbidden, discord.NotFound):
+        return False
+    except discord.HTTPException:
+        log.exception("Discord rejected a Kat game DM to user %s", member.id)
+        return False
+
+
 def build_alert_embed(
     *,
     guild: discord.Guild,
@@ -1691,13 +2248,13 @@ def build_alert_embed(
         value=inviter.mention,
         inline=True,
     )
-    embed.set_footer(text="Use the buttons below to follow or mute this LFG post")
+    embed.set_footer(text="Use the buttons below to follow or mute this game channel")
     return embed
 
 
 @bot.tree.command(
     name="ping",
-    description="Post an @here game alert using the current LFG post name.",
+    description="Ping @here and alert subscribers for the matching game.",
 )
 @app_commands.guild_only()
 async def ping_command(interaction: discord.Interaction) -> None:
@@ -1714,38 +2271,60 @@ async def ping_command(interaction: discord.Interaction) -> None:
 
     if not isinstance(channel, (discord.TextChannel, discord.Thread)):
         await interaction.response.send_message(
-            "Use `/ping` inside an approved LFG text channel or forum post.",
-            ephemeral=True,
-        )
-        return
-
-    if not LFG_CHANNEL_IDS:
-        await interaction.response.send_message(
-            "Kat's LFG alerts are not configured yet. Add `LFG_CHANNEL_IDS` in Railway.",
+            "Use `/ping` inside a text channel, forum post, or thread.",
             ephemeral=True,
         )
         return
 
     context = get_lfg_context(guild, channel)
-    if context.allowed_channel_id not in LFG_CHANNEL_IDS:
-        await interaction.response.send_message(
-            "Use `/ping` inside one of the LFG channels configured in Railway.",
-            ephemeral=True,
-        )
-        return
 
     if not member_can_ping(user):
         await interaction.response.send_message(
-            "You do not have permission to send Kat LFG alerts.",
+            "You do not have permission to send Kat game alerts.",
             ephemeral=True,
         )
         return
 
     me = guild.me
-    if me is None or not channel.permissions_for(me).mention_everyone:
+    if me is None:
         await interaction.response.send_message(
-            "Kat needs the **Mention @everyone, @here, and All Roles** permission "
-            "in this LFG channel before it can send an `@here` alert.",
+            "Kat could not read its server permissions.",
+            ephemeral=True,
+        )
+        return
+
+    game_role, configured_game_name = await find_game_notification_role(
+        bot.pool,
+        guild,
+        context.post_name,
+    )
+
+    if configured_game_name is not None and game_role is None:
+        await interaction.response.send_message(
+            (
+                f"The game **{configured_game_name}** is configured, but its Discord "
+                "role no longer exists. An admin needs to repair it with `/gameadmin`."
+            ),
+            ephemeral=True,
+        )
+        return
+
+    if game_role is None:
+        await interaction.response.send_message(
+            (
+                f"No game is configured for **{context.post_name}**. An admin must add "
+                "that game with `/gameadmin create` or `/gameadmin add` before `/ping` "
+                "can be used here."
+            ),
+            ephemeral=True,
+        )
+        return
+
+    mention_permissions = channel.permissions_for(me)
+    if not mention_permissions.mention_everyone:
+        await interaction.response.send_message(
+            "Kat needs **Mention @everyone, @here, and All Roles** in this channel "
+            "before it can send the `@here` game alert.",
             ephemeral=True,
         )
         return
@@ -1753,12 +2332,12 @@ async def ping_command(interaction: discord.Interaction) -> None:
     remaining = await bot.cooldown_remaining(guild.id)
     if remaining > 0 and not user.guild_permissions.manage_guild:
         await interaction.response.send_message(
-            f"Kat LFG alerts are on cooldown for **{format_wait(remaining)}**.",
+            f"Kat game alerts are on cooldown for **{format_wait(remaining)}**.",
             ephemeral=True,
         )
         return
 
-    game_name = context.post_name.strip()
+    game_name = configured_game_name or context.post_name.strip()
 
     voice_channel: discord.VoiceChannel | None = None
     if user.voice is not None and isinstance(user.voice.channel, discord.VoiceChannel):
@@ -1776,6 +2355,9 @@ async def ping_command(interaction: discord.Interaction) -> None:
         voice_channel=voice_channel,
     )
 
+    # Use only @here in the public post. The game role is used silently to choose
+    # DM subscribers, preventing a member from receiving both an @here mention and
+    # a second role mention in the same alert.
     await interaction.response.send_message(
         content="@here",
         embed=embed,
@@ -1785,21 +2367,74 @@ async def ping_command(interaction: discord.Interaction) -> None:
         ),
         allowed_mentions=discord.AllowedMentions(
             everyone=True,
-            users=False,
+            users=True,
             roles=False,
             replied_user=False,
         ),
     )
+
+    opted_out_rows = await bot.pool.fetch(
+        "SELECT user_id FROM katping_opt_outs WHERE guild_id = $1;",
+        guild.id,
+    )
+    opted_out_ids = {int(row["user_id"]) for row in opted_out_rows}
+
+    # De-duplicate by user ID. Members who are online and can see this channel are
+    # already covered by @here, so only subscribers not covered by @here receive a DM.
+    unique_role_members = {member.id: member for member in game_role.members}
+    dm_recipients: list[discord.Member] = []
+    skipped = 0
+    covered_by_here = 0
+
+    for member in unique_role_members.values():
+        if member.bot or member.id == user.id or member.id in opted_out_ids:
+            skipped += 1
+            continue
+        if member_is_covered_by_here(member, channel):
+            covered_by_here += 1
+            continue
+        dm_recipients.append(member)
+
+    if len(dm_recipients) > MAX_RECIPIENTS:
+        skipped += len(dm_recipients) - MAX_RECIPIENTS
+        dm_recipients = dm_recipients[:MAX_RECIPIENTS]
+
+    delivered = 0
+    failed = 0
+    for member in dm_recipients:
+        sent = await send_game_dm(
+            member,
+            inviter=user,
+            game_name=game_name,
+            context=context,
+            voice_channel=voice_channel,
+        )
+        if sent:
+            delivered += 1
+        else:
+            failed += 1
 
     await bot.log_ping(
         guild_id=guild.id,
         inviter_id=user.id,
         context=context,
         game_name=game_name,
-        delivered=1,
-        failed=0,
-        skipped=0,
+        delivered=delivered,
+        failed=failed,
+        skipped=skipped + covered_by_here,
     )
+
+    try:
+        await interaction.followup.send(
+            (
+                f"Alert posted. **{covered_by_here}** subscribed member(s) were "
+                f"already covered by `@here`; DM sent: **{delivered}**, failed: "
+                f"**{failed}**, skipped: **{skipped}**."
+            ),
+            ephemeral=True,
+        )
+    except discord.HTTPException:
+        log.exception("Could not send the private /ping delivery summary")
 
 
 @ping_command.error
@@ -1819,6 +2454,352 @@ async def ping_command_error(
     else:
         await interaction.response.send_message(message, ephemeral=True)
 
+
+
+
+@bot.tree.command(
+    name="gamepanel",
+    description="Post the self-assignable game notification role panel.",
+)
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(manage_guild=True)
+async def game_panel(interaction: discord.Interaction) -> None:
+    assert interaction.guild is not None
+    rows = await fetch_game_role_rows(bot.pool, interaction.guild.id)
+    embed = build_game_roles_panel_embed(interaction.guild, len(rows))
+    await interaction.response.send_message(
+        embed=embed,
+        view=GameRolesPanelView(bot),
+    )
+
+
+@game_panel.error
+async def game_panel_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+) -> None:
+    if isinstance(error, app_commands.MissingPermissions):
+        message = "Only administrators with **Manage Server** can post this panel."
+    else:
+        log.exception("/gamepanel failed", exc_info=error)
+        message = "The game-role panel could not be posted. Check the Railway logs."
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+
+game_admin_group = app_commands.Group(
+    name="gameadmin",
+    description="Administratively manage self-assignable game notification roles.",
+)
+
+
+async def validate_game_role_for_self_assignment(
+    interaction: discord.Interaction,
+    role: discord.Role,
+) -> str | None:
+    guild = interaction.guild
+    if guild is None:
+        return "This command only works inside a Discord server."
+    me = guild.me
+    if role.is_default():
+        return "The `@everyone` role cannot be self-assigned."
+    if role.managed:
+        return "Integration-managed roles cannot be self-assigned."
+    if role_has_privileged_permissions(role):
+        return (
+            "That role has moderation or management permissions. Game notification "
+            "roles must be safe, non-staff roles."
+        )
+    if me is None or not me.guild_permissions.manage_roles:
+        return "Kat needs **Manage Roles** before this role can be used."
+    if role >= me.top_role:
+        return "Move Kat's role above that game role first."
+    return None
+
+
+@game_admin_group.command(
+    name="add",
+    description="Connect an existing safe role to a game name.",
+)
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.describe(
+    game="Game/post name that /ping should match",
+    role="Existing notification role members can select",
+    emoji="Unicode emoji shown in the selector",
+)
+async def game_admin_add(
+    interaction: discord.Interaction,
+    game: str,
+    role: discord.Role,
+    emoji: str = "🎮",
+) -> None:
+    assert interaction.guild is not None
+    game_name = game.strip()
+    game_key = normalize_game_key(game_name)
+    emoji = emoji.strip() or "🎮"
+
+    if not game_key or len(game_name) < 2 or len(game_name) > 80:
+        await interaction.response.send_message(
+            "The game name must be between 2 and 80 characters.",
+            ephemeral=True,
+        )
+        return
+    if len(emoji) > 8 or is_custom_emoji_code(emoji):
+        await interaction.response.send_message(
+            "Use one short standard Unicode emoji, such as `🎮`, `🔥`, or `🏆`.",
+            ephemeral=True,
+        )
+        return
+
+    role_error = await validate_game_role_for_self_assignment(interaction, role)
+    if role_error:
+        await interaction.response.send_message(role_error, ephemeral=True)
+        return
+
+
+    conflicting = await bot.pool.fetchrow(
+        """
+        SELECT game_name FROM game_notification_roles
+        WHERE guild_id = $1 AND role_id = $2 AND game_key <> $3;
+        """,
+        interaction.guild.id,
+        role.id,
+        game_key,
+    )
+    if conflicting is not None:
+        await interaction.response.send_message(
+            f"{role.mention} is already connected to **{conflicting['game_name']}**. "
+            "Use a different role or remove the old game first.",
+            ephemeral=True,
+        )
+        return
+
+    await bot.pool.execute(
+        """
+        INSERT INTO game_notification_roles (
+            guild_id, game_key, game_name, role_id, emoji, created_by
+        )
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (guild_id, game_key)
+        DO UPDATE SET
+            game_name = EXCLUDED.game_name,
+            role_id = EXCLUDED.role_id,
+            emoji = EXCLUDED.emoji,
+            updated_at = NOW();
+        """,
+        interaction.guild.id,
+        game_key,
+        game_name,
+        role.id,
+        emoji,
+        interaction.user.id,
+    )
+    await interaction.response.send_message(
+        f"Added **{emoji} {game_name}** using {role.mention}. `/ping` will mention "
+        "that role when the current post name matches this game.",
+        ephemeral=True,
+    )
+
+
+@game_admin_group.command(
+    name="create",
+    description="Create a new safe notification role and connect it to a game.",
+)
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.describe(
+    game="Game/post name that /ping should match",
+    emoji="Unicode emoji shown in the role and selector",
+)
+async def game_admin_create(
+    interaction: discord.Interaction,
+    game: str,
+    emoji: str = "🎮",
+) -> None:
+    assert interaction.guild is not None
+    game_name = game.strip()
+    game_key = normalize_game_key(game_name)
+    emoji = emoji.strip() or "🎮"
+
+    if not game_key or len(game_name) < 2 or len(game_name) > 70:
+        await interaction.response.send_message(
+            "The game name must be between 2 and 70 characters.",
+            ephemeral=True,
+        )
+        return
+    if len(emoji) > 8 or is_custom_emoji_code(emoji):
+        await interaction.response.send_message(
+            "Use one short standard Unicode emoji, such as `🎮`, `🔥`, or `🏆`.",
+            ephemeral=True,
+        )
+        return
+
+    me = interaction.guild.me
+    if me is None or not me.guild_permissions.manage_roles:
+        await interaction.response.send_message(
+            "Kat needs **Manage Roles** before it can create game roles.",
+            ephemeral=True,
+        )
+        return
+
+
+    existing = await bot.pool.fetchval(
+        "SELECT 1 FROM game_notification_roles WHERE guild_id = $1 AND game_key = $2;",
+        interaction.guild.id,
+        game_key,
+    )
+    if existing:
+        await interaction.response.send_message(
+            "That game is already configured. Use `/gameadmin add` to replace its role.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        role = await interaction.guild.create_role(
+            name=f"{emoji} {game_name}"[:100],
+            permissions=discord.Permissions.none(),
+            mentionable=False,
+            reason=f"Kat game notification role created by {interaction.user}",
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "Kat could not create the role. Give it **Manage Roles**.",
+            ephemeral=True,
+        )
+        return
+    except discord.HTTPException:
+        log.exception("Discord rejected creation of a game notification role")
+        await interaction.response.send_message(
+            "Discord could not create that role right now.",
+            ephemeral=True,
+        )
+        return
+
+    await bot.pool.execute(
+        """
+        INSERT INTO game_notification_roles (
+            guild_id, game_key, game_name, role_id, emoji, created_by
+        )
+        VALUES ($1, $2, $3, $4, $5, $6);
+        """,
+        interaction.guild.id,
+        game_key,
+        game_name,
+        role.id,
+        emoji,
+        interaction.user.id,
+    )
+    await interaction.response.send_message(
+        f"Created {role.mention} and connected it to **{game_name}**.",
+        ephemeral=True,
+    )
+
+
+@game_admin_group.command(
+    name="remove",
+    description="Remove a game from the selector and optionally delete its role.",
+)
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.describe(
+    game="Configured game name",
+    delete_role="Also delete the linked Discord role",
+)
+async def game_admin_remove(
+    interaction: discord.Interaction,
+    game: str,
+    delete_role: bool = False,
+) -> None:
+    assert interaction.guild is not None
+    game_key = normalize_game_key(game)
+    row = await bot.pool.fetchrow(
+        """
+        DELETE FROM game_notification_roles
+        WHERE guild_id = $1 AND game_key = $2
+        RETURNING game_name, role_id;
+        """,
+        interaction.guild.id,
+        game_key,
+    )
+    if row is None:
+        await interaction.response.send_message(
+            "That game is not configured.",
+            ephemeral=True,
+        )
+        return
+
+    role = interaction.guild.get_role(int(row["role_id"]))
+    role_note = "The Discord role was kept."
+    if delete_role and role is not None:
+        try:
+            await role.delete(reason=f"Kat game role removed by {interaction.user}")
+            role_note = "The Discord role was also deleted."
+        except (discord.Forbidden, discord.HTTPException):
+            role_note = "Kat could not delete the Discord role, so it was kept."
+
+    await interaction.response.send_message(
+        f"Removed **{row['game_name']}** from the game-role panel. {role_note}",
+        ephemeral=True,
+    )
+
+
+@game_admin_group.command(
+    name="list",
+    description="List every configured game notification role.",
+)
+@app_commands.guild_only()
+@app_commands.checks.has_permissions(manage_guild=True)
+async def game_admin_list(interaction: discord.Interaction) -> None:
+    assert interaction.guild is not None
+    rows = await fetch_game_role_rows(bot.pool, interaction.guild.id)
+    if not rows:
+        await interaction.response.send_message(
+            "No game notification roles are configured.",
+            ephemeral=True,
+        )
+        return
+
+    lines: list[str] = []
+    for row in rows:
+        role = interaction.guild.get_role(int(row["role_id"]))
+        role_text = role.mention if role is not None else "`missing role`"
+        lines.append(f"{row['emoji']} **{row['game_name']}** — {role_text}")
+
+    embed = discord.Embed(
+        title="Configured Game Notification Roles",
+        description="\n".join(lines),
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(text=f"{len(rows)} game role(s) configured")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@game_admin_group.error
+async def game_admin_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+) -> None:
+    if isinstance(error, app_commands.MissingPermissions):
+        message = "Only administrators with **Manage Server** can manage game roles."
+    else:
+        original = getattr(error, "original", error)
+        log.error(
+            "Game admin command failed: %r",
+            original,
+            exc_info=(type(original), original, original.__traceback__),
+        )
+        message = "The game-role command failed. Check the Railway logs."
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+
+bot.tree.add_command(game_admin_group)
 
 @bot.tree.command(name="rank", description="Show voice level and progress.")
 @app_commands.guild_only()
