@@ -1127,8 +1127,8 @@ def build_role_settings_panel_embed(guild: discord.Guild) -> discord.Embed:
     embed = discord.Embed(
         title="ROLES & SETTINGS",
         description=(
-            "A clean control panel for your alerts, nickname badge, and voice "
-            "level setup. Every button opens privately just for you."
+            "Manage your game alerts, nickname badge, and voice-level settings. "
+            "Each option opens privately for the member using it."
         ),
         color=discord.Color.from_rgb(88, 101, 242),
     )
@@ -1144,13 +1144,13 @@ def build_role_settings_panel_embed(guild: discord.Guild) -> discord.Embed:
     )
     embed.add_field(
         name="⚡ Auto Upgrade",
-        value="Toggle automatic badge upgrades on or off.",
-        inline=False,
+        value="Keep your badge matched to your newest unlock.",
+        inline=True,
     )
     embed.add_field(
         name="🪪 Nickname Card",
-        value="See your level, voice time, badge, and current nickname.",
-        inline=False,
+        value="View your level, voice time, badge, and nickname.",
+        inline=True,
     )
     embed.set_footer(text="Public panel • Private actions")
     if guild.icon is not None:
