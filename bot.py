@@ -1,6 +1,3 @@
-
-
-
 from __future__ import annotations
 
 import asyncio
@@ -473,6 +470,8 @@ def valid_selected_emoji(
     selected_emoji: str | None,
     level: int,
     unlocks: tuple[EmojiUnlock, ...],
+    *,
+    ignore_level_requirement: bool = False,
 ) -> str:
     """Resolve the equipped badge, automatically choosing one when unset."""
     emoji = (selected_emoji or "").strip()
@@ -487,7 +486,9 @@ def valid_selected_emoji(
         return available[-1][1] if available else ""
 
     required_level = emoji_required_level(unlocks, emoji)
-    if required_level is None or level < required_level:
+    if required_level is None:
+        return ""
+    if level < required_level and not ignore_level_requirement:
         return ""
     return emoji
 
@@ -507,12 +508,19 @@ def nickname_with_level(
     level: int,
     selected_emoji: str = "",
     unlocks: tuple[EmojiUnlock, ...] = (),
+    *,
+    ignore_level_requirement: bool = False,
 ) -> str:
     """Return Badge│ExampleName⁰, or │ExampleName⁰ with no equipped badge."""
     current_name = member.nick or member.global_name or member.name
     base_name = clean_base_name(current_name)
     suffix = superscript_number(level)
-    display_emoji = valid_selected_emoji(selected_emoji, level, unlocks)
+    display_emoji = valid_selected_emoji(
+        selected_emoji,
+        level,
+        unlocks,
+        ignore_level_requirement=ignore_level_requirement,
+    )
     nickname_badge = emoji_nickname_badge(unlocks, display_emoji)
     prefix = f"{nickname_badge}{NICKNAME_PREFIX}"
     max_base_length = max(
@@ -1280,6 +1288,7 @@ class BadgeVaultView(discord.ui.View):
         self.unlocked_badges: list[EmojiUnlock] = []
         self.saved_selection = ""
         self.display_badge = ""
+        self.level_locked = False
 
     async def refresh(self) -> None:
         row = await self.bot.get_or_create_stats(self.guild.id, self.member.id)
@@ -1288,10 +1297,12 @@ class BadgeVaultView(discord.ui.View):
         self.unlocks = await self.bot.get_emoji_unlocks(self.guild.id)
         self.unlocked_badges = list(unlocked_emojis(self.level, self.unlocks))
         self.saved_selection = str(row["selected_emoji"] or "")
+        self.level_locked = bool(row["level_locked"])
         self.display_badge = valid_selected_emoji(
             self.saved_selection,
             self.level,
             self.unlocks,
+            ignore_level_requirement=self.level_locked,
         )
         self.clear_items()
         if self.unlocked_badges:
@@ -1320,7 +1331,7 @@ class BadgeVaultView(discord.ui.View):
             )
         embed.add_field(
             name="Nickname Preview",
-            value=f"`{nickname_with_level(self.member, self.level, self.saved_selection, self.unlocks)}`",
+            value=f"`{nickname_with_level(self.member, self.level, self.saved_selection, self.unlocks, ignore_level_requirement=self.level_locked)}`",
             inline=False,
         )
         if note:
@@ -1382,7 +1393,13 @@ async def build_nickname_card_embed(bot: "KatBot", member: discord.Member) -> di
     remaining = max(0, required - progress)
     unlocks = await bot.get_emoji_unlocks(member.guild.id)
     saved_selection = str(row["selected_emoji"] or "")
-    display_emoji = valid_selected_emoji(saved_selection, level, unlocks)
+    level_locked = bool(row["level_locked"])
+    display_emoji = valid_selected_emoji(
+        saved_selection,
+        level,
+        unlocks,
+        ignore_level_requirement=level_locked,
+    )
     next_unlock = next_emoji_unlock(level, unlocks)
 
     embed = discord.Embed(
@@ -1401,7 +1418,7 @@ async def build_nickname_card_embed(bot: "KatBot", member: discord.Member) -> di
     )
     embed.add_field(
         name="Current Nickname",
-        value=f"`{nickname_with_level(member, level, saved_selection, unlocks)}`",
+        value=f"`{nickname_with_level(member, level, saved_selection, unlocks, ignore_level_requirement=level_locked)}`",
         inline=False,
     )
     embed.add_field(
@@ -1520,7 +1537,12 @@ class RoleSettingsPanelView(discord.ui.View):
         level = level_from_total_seconds(total)
         unlocks = await self.bot.get_emoji_unlocks(guild.id)
         saved_selection = str(row["selected_emoji"] or "")
-        current_badge = valid_selected_emoji(saved_selection, level, unlocks)
+        current_badge = valid_selected_emoji(
+            saved_selection,
+            level,
+            unlocks,
+            ignore_level_requirement=bool(row["level_locked"]),
+        )
 
         if saved_selection.strip() == "":
             new_selection = current_badge or NO_EMOJI_SELECTION
@@ -2158,6 +2180,8 @@ class KatBot(commands.Bot):
         member: discord.Member,
         level: int,
         selected_emoji: str | None = None,
+        *,
+        level_locked: bool | None = None,
     ) -> str:
         """Apply a nickname and return updated, unchanged, or a skip reason."""
         if member.bot:
@@ -2172,16 +2196,26 @@ class KatBot(commands.Bot):
         if member.top_role >= me.top_role:
             return "role_hierarchy"
 
-        if selected_emoji is None:
-            selected_emoji = await self.pool.fetchval(
-                "SELECT selected_emoji FROM voice_levels "
+        state_row: asyncpg.Record | None = None
+        if selected_emoji is None or level_locked is None:
+            state_row = await self.pool.fetchrow(
+                "SELECT selected_emoji, level_locked FROM voice_levels "
                 "WHERE guild_id = $1 AND user_id = $2;",
                 guild.id,
                 member.id,
             )
+        if selected_emoji is None:
+            selected_emoji = state_row["selected_emoji"] if state_row else ""
+        if level_locked is None:
+            level_locked = bool(state_row["level_locked"]) if state_row else False
 
         unlocks = await self.get_emoji_unlocks(guild.id)
-        equipped_emoji = valid_selected_emoji(selected_emoji, level, unlocks)
+        equipped_emoji = valid_selected_emoji(
+            selected_emoji,
+            level,
+            unlocks,
+            ignore_level_requirement=level_locked,
+        )
         if (
             selected_emoji
             and selected_emoji != NO_EMOJI_SELECTION
@@ -2201,6 +2235,7 @@ class KatBot(commands.Bot):
             level,
             equipped_emoji,
             unlocks,
+            ignore_level_requirement=level_locked,
         )
         if member.nick == new_nickname:
             return "unchanged"
@@ -2257,14 +2292,18 @@ class KatBot(commands.Bot):
         await self.ensure_guild_rows(guild)
         rows = await self.pool.fetch(
             """
-            SELECT user_id, total_voice_seconds, selected_emoji
+            SELECT user_id, total_voice_seconds, selected_emoji, level_locked
             FROM voice_levels
             WHERE guild_id = $1;
             """,
             guild.id,
         )
         stats = {
-            row["user_id"]: (row["total_voice_seconds"], row["selected_emoji"])
+            row["user_id"]: (
+                row["total_voice_seconds"],
+                row["selected_emoji"],
+                bool(row["level_locked"]),
+            )
             for row in rows
         }
 
@@ -2283,12 +2322,16 @@ class KatBot(commands.Bot):
                     skipped += 1
                 continue
 
-            total_seconds, selected_emoji = stats.get(member.id, (0, ""))
+            total_seconds, selected_emoji, level_locked = stats.get(
+                member.id,
+                (0, "", False),
+            )
             level = level_from_total_seconds(total_seconds)
             result = await self.apply_level_nickname(
                 member,
                 level,
                 selected_emoji,
+                level_locked=level_locked,
             )
 
             if result == "updated":
@@ -3338,7 +3381,29 @@ async def level_admin_set(
     fixed_level = int(level)
     fixed_seconds = cumulative_seconds_for_level(fixed_level)
 
-    row = await bot.pool.fetchrow(
+    # Freeze the badge currently visible before changing the level. This prevents
+    # the fixed-level command from automatically switching to the badge assigned
+    # to the new level.
+    current_row = await bot.get_or_create_stats(interaction.guild.id, member.id)
+    current_level = level_from_total_seconds(int(current_row["total_voice_seconds"]))
+    unlocks = await bot.get_emoji_unlocks(interaction.guild.id)
+    current_saved = str(current_row["selected_emoji"] or "")
+    current_badge = valid_selected_emoji(
+        current_saved,
+        current_level,
+        unlocks,
+        ignore_level_requirement=bool(current_row["level_locked"]),
+    )
+    if current_saved == NO_EMOJI_SELECTION:
+        preserved_selection = NO_EMOJI_SELECTION
+    elif current_badge:
+        # Convert Auto mode into a manual selection so the badge stays unchanged.
+        preserved_selection = current_badge
+    else:
+        # No visible badge before the level change means no badge afterward.
+        preserved_selection = NO_EMOJI_SELECTION
+
+    await bot.pool.execute(
         """
         INSERT INTO voice_levels (
             guild_id,
@@ -3346,29 +3411,32 @@ async def level_admin_set(
             total_voice_seconds,
             level,
             nickname_level,
+            selected_emoji,
             level_locked,
             last_active_at
         )
-        VALUES ($1, $2, $3, $4, -1, TRUE, NOW())
+        VALUES ($1, $2, $3, $4, -1, $5, TRUE, NOW())
         ON CONFLICT (guild_id, user_id)
         DO UPDATE SET
             total_voice_seconds = EXCLUDED.total_voice_seconds,
             level = EXCLUDED.level,
             nickname_level = -1,
+            selected_emoji = EXCLUDED.selected_emoji,
             level_locked = TRUE,
-            last_active_at = NOW()
-        RETURNING selected_emoji;
+            last_active_at = NOW();
         """,
         interaction.guild.id,
         member.id,
         fixed_seconds,
         fixed_level,
+        preserved_selection,
     )
-    selected_emoji = str(row["selected_emoji"] or "") if row else ""
+
     nickname_result = await bot.apply_level_nickname(
         member,
         fixed_level,
-        selected_emoji,
+        preserved_selection,
+        level_locked=True,
     )
     if nickname_result in {"updated", "unchanged"}:
         await bot.mark_nickname_synced(
@@ -3377,9 +3445,11 @@ async def level_admin_set(
             fixed_level,
         )
 
+    badge_text = current_badge if current_badge else "no badge"
     message = (
         f"🔒 {member.mention} is now fixed at **Level {fixed_level}** "
-        f"`{superscript_number(fixed_level)}`. Voice activity will not change it."
+        f"`{superscript_number(fixed_level)}`. Voice activity will not change it.\n"
+        f"Their existing emoji was preserved: **{badge_text}**."
     )
     if nickname_result not in {"updated", "unchanged"}:
         message += (
@@ -3511,13 +3581,19 @@ async def rank(
     level, progress, required = progress_for_total(total)
     remaining = max(0, required - progress)
     unlocks = await bot.get_emoji_unlocks(interaction.guild.id)
-    selected_emoji = valid_selected_emoji(row["selected_emoji"], level, unlocks)
+    selected_emoji = valid_selected_emoji(
+        row["selected_emoji"],
+        level,
+        unlocks,
+        ignore_level_requirement=bool(row["level_locked"]),
+    )
 
     # Reapply the nickname whenever rank is checked so the displayed level stays current.
     nickname_result = await bot.apply_level_nickname(
         target,
         level,
-        selected_emoji,
+        row["selected_emoji"],
+        level_locked=bool(row["level_locked"]),
     )
     if nickname_result in {"updated", "unchanged"}:
         await bot.mark_nickname_synced(interaction.guild.id, target.id, level)
@@ -3539,7 +3615,7 @@ async def rank(
     )
     embed.add_field(
         name="Nickname",
-        value=f"`{nickname_with_level(target, level, selected_emoji, unlocks)}`",
+        value=f"`{nickname_with_level(target, level, row['selected_emoji'], unlocks, ignore_level_requirement=bool(row['level_locked']))}`",
         inline=False,
     )
 
@@ -3658,11 +3734,17 @@ async def sync_nickname(interaction: discord.Interaction) -> None:
     )
     level = level_from_total_seconds(row["total_voice_seconds"])
     unlocks = await bot.get_emoji_unlocks(interaction.guild.id)
-    selected_emoji = valid_selected_emoji(row["selected_emoji"], level, unlocks)
+    selected_emoji = valid_selected_emoji(
+        row["selected_emoji"],
+        level,
+        unlocks,
+        ignore_level_requirement=bool(row["level_locked"]),
+    )
     result = await bot.apply_level_nickname(
         interaction.user,
         level,
-        selected_emoji,
+        row["selected_emoji"],
+        level_locked=bool(row["level_locked"]),
     )
 
     if result in {"updated", "unchanged"}:
@@ -3673,7 +3755,7 @@ async def sync_nickname(interaction: discord.Interaction) -> None:
         )
         await interaction.response.send_message(
             f"Your nickname is now "
-            f"`{nickname_with_level(interaction.user, level, selected_emoji, unlocks)}`.",
+            f"`{nickname_with_level(interaction.user, level, row['selected_emoji'], unlocks, ignore_level_requirement=bool(row['level_locked']))}`.",
             ephemeral=True,
         )
     else:
@@ -3764,7 +3846,12 @@ async def emoji_list(interaction: discord.Interaction) -> None:
     )
     level = level_from_total_seconds(row["total_voice_seconds"])
     unlocks = await bot.get_emoji_unlocks(interaction.guild.id)
-    selected_emoji = valid_selected_emoji(row["selected_emoji"], level, unlocks)
+    selected_emoji = valid_selected_emoji(
+        row["selected_emoji"],
+        level,
+        unlocks,
+        ignore_level_requirement=bool(row["level_locked"]),
+    )
 
     lines: list[str] = []
     for required_level, emoji, _nickname_badge in unlocks:
