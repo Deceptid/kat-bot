@@ -3353,9 +3353,32 @@ level_admin_group = app_commands.Group(
 )
 
 
+async def level_admin_emoji_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    """Suggest configured server badges for /leveladmin set."""
+    if interaction.guild_id is None:
+        return []
+    try:
+        unlocks = await bot.get_emoji_unlocks(interaction.guild_id)
+    except Exception:
+        log.exception("Level-admin emoji autocomplete failed")
+        return []
+
+    search = current.casefold().strip()
+    choices: list[app_commands.Choice[str]] = []
+    for required_level, configured, _nickname_badge in unlocks:
+        label = f"{configured} — Level {required_level}"
+        if search and search not in label.casefold():
+            continue
+        choices.append(app_commands.Choice(name=label[:100], value=configured))
+    return choices[:25]
+
+
 @level_admin_group.command(
     name="set",
-    description="Set a member to a fixed level that will not change from voice activity.",
+    description="Set and lock a member's level, with an optional nickname emoji.",
 )
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_guild=True)
@@ -3363,11 +3386,17 @@ level_admin_group = app_commands.Group(
 @app_commands.describe(
     member="The member whose level should be fixed",
     level="The exact level to assign and lock",
+    emoji=(
+        "Optional configured emoji. Leave blank to use the highest badge unlocked "
+        "at the assigned level"
+    ),
 )
+@app_commands.autocomplete(emoji=level_admin_emoji_autocomplete)
 async def level_admin_set(
     interaction: discord.Interaction,
     member: discord.Member,
     level: app_commands.Range[int, 0, 100000],
+    emoji: str | None = None,
 ) -> None:
     assert interaction.guild is not None
     if member.bot:
@@ -3380,28 +3409,28 @@ async def level_admin_set(
     await interaction.response.defer(ephemeral=True, thinking=True)
     fixed_level = int(level)
     fixed_seconds = cumulative_seconds_for_level(fixed_level)
-
-    # Freeze the badge currently visible before changing the level. This prevents
-    # the fixed-level command from automatically switching to the badge assigned
-    # to the new level.
-    current_row = await bot.get_or_create_stats(interaction.guild.id, member.id)
-    current_level = level_from_total_seconds(int(current_row["total_voice_seconds"]))
     unlocks = await bot.get_emoji_unlocks(interaction.guild.id)
-    current_saved = str(current_row["selected_emoji"] or "")
-    current_badge = valid_selected_emoji(
-        current_saved,
-        current_level,
-        unlocks,
-        ignore_level_requirement=bool(current_row["level_locked"]),
-    )
-    if current_saved == NO_EMOJI_SELECTION:
-        preserved_selection = NO_EMOJI_SELECTION
-    elif current_badge:
-        # Convert Auto mode into a manual selection so the badge stays unchanged.
-        preserved_selection = current_badge
+
+    requested_emoji = (emoji or "").strip()
+    if requested_emoji:
+        required_level = emoji_required_level(unlocks, requested_emoji)
+        if required_level is None:
+            await interaction.followup.send(
+                "That emoji is not configured for this server. Choose one from the "
+                "suggestions or check `/emojiadmin list`.",
+                ephemeral=True,
+            )
+            return
+        selected_emoji = requested_emoji
+        badge_reason = "the emoji you selected"
     else:
-        # No visible badge before the level change means no badge afterward.
-        preserved_selection = NO_EMOJI_SELECTION
+        available = unlocked_emojis(fixed_level, unlocks)
+        if available:
+            selected_emoji = available[-1][1]
+            badge_reason = "the highest emoji unlocked at that level"
+        else:
+            selected_emoji = NO_EMOJI_SELECTION
+            badge_reason = "no emoji because none is unlocked at that level"
 
     await bot.pool.execute(
         """
@@ -3429,13 +3458,13 @@ async def level_admin_set(
         member.id,
         fixed_seconds,
         fixed_level,
-        preserved_selection,
+        selected_emoji,
     )
 
     nickname_result = await bot.apply_level_nickname(
         member,
         fixed_level,
-        preserved_selection,
+        selected_emoji,
         level_locked=True,
     )
     if nickname_result in {"updated", "unchanged"}:
@@ -3445,16 +3474,16 @@ async def level_admin_set(
             fixed_level,
         )
 
-    badge_text = current_badge if current_badge else "no badge"
+    badge_text = selected_emoji if selected_emoji != NO_EMOJI_SELECTION else "None"
     message = (
         f"🔒 {member.mention} is now fixed at **Level {fixed_level}** "
         f"`{superscript_number(fixed_level)}`. Voice activity will not change it.\n"
-        f"Their existing emoji was preserved: **{badge_text}**."
+        f"Emoji: **{badge_text}** — {badge_reason}."
     )
     if nickname_result not in {"updated", "unchanged"}:
         message += (
-            "\nThe level was saved, but Kat could not update the nickname because "
-            "of Discord nickname permissions or role hierarchy."
+            "\nThe level and emoji were saved, but Kat could not update the nickname "
+            "because of Discord nickname permissions or role hierarchy."
         )
     await interaction.followup.send(message, ephemeral=True)
 
