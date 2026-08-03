@@ -139,17 +139,23 @@ def parse_emoji_unlocks(raw: str) -> tuple[tuple[int, str], ...]:
 
 
 def parse_bulk_emoji_unlocks(raw: str) -> tuple[tuple[int, str], ...]:
-    """Parse pasted emoji unlock text from a modal or slash command.
+    """Parse a copy/paste block containing one level=emoji entry per line.
 
-    Accepts entries separated by new lines, commas, or semicolons, for example:
-        0=⚪
-        1=🟣
-        2=🔴
-        5=🟢
+    Commas and semicolons are also accepted.
     """
-    normalized = raw.replace("\r", "\n").replace(";", ",")
-    normalized = re.sub(r"\n+", ",", normalized)
-    return parse_emoji_unlocks(normalized)
+    normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = re.sub(r"[;\n]+", ",", normalized)
+
+    try:
+        unlocks = parse_emoji_unlocks(normalized)
+    except RuntimeError as exc:
+        message = str(exc).replace("EMOJI_UNLOCKS", "Emoji list")
+        raise ValueError(message) from exc
+
+    if len(unlocks) > 100:
+        raise ValueError("The emoji list can contain at most 100 entries.")
+
+    return unlocks
 
 
 DEFAULT_PARSED_EMOJI_UNLOCKS = parse_emoji_unlocks(DEFAULT_EMOJI_UNLOCKS)
@@ -176,6 +182,14 @@ NO_EMOJI_SELECTION = "__none__"
 
 # (required_level, display_emoji, nickname_badge)
 EmojiUnlock = tuple[int, str, str]
+
+
+def format_emoji_unlock_block(unlocks: Iterable[EmojiUnlock]) -> str:
+    """Return every saved entry as a paste-ready level=emoji block."""
+    return "\n".join(
+        f"{required_level}={emoji}"
+        for required_level, emoji, _nickname_badge in unlocks
+    )
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS voice_levels (
@@ -1701,8 +1715,13 @@ class KatBot(commands.Bot):
     async def get_emoji_unlocks(
         self,
         guild_id: int,
+        *,
+        force_refresh: bool = False,
     ) -> tuple[EmojiUnlock, ...]:
-        """Load Unicode unlocks and migrate old custom codes once per server."""
+        """Load Unicode unlocks and optionally bypass the in-memory cache."""
+        if force_refresh:
+            self.invalidate_emoji_unlocks(guild_id)
+
         cached = self._emoji_unlock_cache.get(guild_id)
         if cached is not None:
             return cached
@@ -1957,10 +1976,13 @@ class KatBot(commands.Bot):
     async def replace_all_emoji_unlocks(
         self,
         guild_id: int,
-        raw_entries: str,
-    ) -> tuple[EmojiUnlock, ...]:
-        parsed = parse_bulk_emoji_unlocks(raw_entries)
-        display_emojis = [emoji for _level, emoji in parsed]
+        unlocks: tuple[tuple[int, str], ...],
+    ) -> int:
+        """Replace the full schedule and recalculate every saved member badge."""
+        if not unlocks:
+            raise ValueError("The emoji list must contain at least one entry.")
+
+        reset_count = 0
         async with self.pool.acquire() as connection:
             async with connection.transaction():
                 await connection.execute(
@@ -1975,27 +1997,33 @@ class KatBot(commands.Bot):
                         nickname_badge,
                         required_level
                     )
-                    VALUES ($1, $2, $3, $4);
+                    VALUES ($1, $2, $2, $3);
                     """,
                     [
-                        (guild_id, emoji, emoji, required_level)
-                        for required_level, emoji in parsed
+                        (guild_id, emoji, required_level)
+                        for required_level, emoji in unlocks
                     ],
                 )
-                await connection.execute(
+
+                status = await connection.execute(
                     """
                     UPDATE voice_levels
-                    SET selected_emoji = ''
-                    WHERE guild_id = $1
-                      AND NOT (selected_emoji = ANY($2::TEXT[]))
-                      AND selected_emoji <> $3;
+                    SET selected_emoji = '',
+                        nickname_level = -1
+                    WHERE guild_id = $1;
                     """,
                     guild_id,
-                    display_emojis,
-                    NO_EMOJI_SELECTION,
                 )
-        self.invalidate_emoji_unlocks(guild_id)
-        return tuple((level, emoji, emoji) for level, emoji in parsed)
+                try:
+                    reset_count = int(status.rsplit(" ", 1)[-1])
+                except (TypeError, ValueError):
+                    reset_count = 0
+
+        self._emoji_unlock_cache[guild_id] = tuple(
+            (required_level, emoji, emoji)
+            for required_level, emoji in unlocks
+        )
+        return reset_count
 
     async def get_or_create_stats(
         self,
@@ -3688,54 +3716,106 @@ async def emoji_remove(interaction: discord.Interaction) -> None:
 bot.tree.add_command(emoji_group)
 
 
-class EmojiAdminEditAllModal(discord.ui.Modal, title="Edit All Emoji Unlocks"):
-    entries = discord.ui.TextInput(
-        label="Paste the full emoji unlock list",
-        style=discord.TextStyle.paragraph,
-        placeholder="0=⚪\n1=🟣\n2=🔴\n5=🟢\n10=💎",
-        required=True,
-        max_length=2000,
-    )
+class EmojiBulkEditModal(discord.ui.Modal):
+    """Private popup used to edit every saved emoji unlock in one place."""
 
-    def __init__(self, bot: "KatBot", guild: discord.Guild) -> None:
-        super().__init__(timeout=600)
+    def __init__(
+        self,
+        bot: "KatBot",
+        guild: discord.Guild,
+        current_block: str,
+    ) -> None:
+        super().__init__(title="Edit All Emoji Unlocks", timeout=600)
         self.bot = bot
         self.guild = guild
+        self.emoji_list = discord.ui.TextInput(
+            label="One level=emoji entry per line",
+            style=discord.TextStyle.paragraph,
+            default=current_block,
+            placeholder="0=⚪\n1=🟣\n5=⭐\n10=💎",
+            required=True,
+            max_length=4000,
+        )
+        self.add_item(self.emoji_list)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        try:
-            parsed = await self.bot.replace_all_emoji_unlocks(
-                self.guild.id,
-                str(self.entries),
-            )
-        except (ValueError, RuntimeError) as exc:
-            await interaction.followup.send(
-                f"Could not replace the emoji list: {exc}",
+        if interaction.guild is None or interaction.guild.id != self.guild.id:
+            await interaction.response.send_message(
+                "This emoji editor is no longer connected to the correct server.",
                 ephemeral=True,
             )
             return
 
-        updated, unchanged, skipped = await self.bot.sync_guild_nicknames(self.guild)
-        preview = "\n".join(
-            f"{emoji} — Level **{required_level}**"
-            for required_level, emoji, _nickname_badge in parsed[:12]
-        )
-        if len(parsed) > 12:
-            preview += f"\n...and **{len(parsed) - 12}** more"
-
-        embed = discord.Embed(
-            title="Emoji Unlocks Updated",
-            description=preview or "No emoji unlocks configured.",
-            color=discord.Color.green(),
-        )
-        embed.set_footer(
-            text=(
-                f"Saved {len(parsed)} entries • Nicknames updated: {updated} • "
-                f"Already correct: {unchanged} • Skipped: {skipped}"
+        member = interaction.user
+        if (
+            not isinstance(member, discord.Member)
+            or not member.guild_permissions.manage_guild
+        ):
+            await interaction.response.send_message(
+                "You need the **Manage Server** permission to edit all emojis.",
+                ephemeral=True,
             )
+            return
+
+        try:
+            parsed = parse_bulk_emoji_unlocks(str(self.emoji_list.value))
+            unlocks = tuple(
+                (required_level, validate_display_emoji(emoji))
+                for required_level, emoji in parsed
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        if not interaction.guild.chunked:
+            try:
+                await interaction.guild.chunk(cache=True)
+            except Exception:
+                log.exception(
+                    "Could not refresh the member cache before emoji bulk sync "
+                    "for guild %s",
+                    interaction.guild.id,
+                )
+
+        reset_count = await self.bot.replace_all_emoji_unlocks(
+            interaction.guild.id,
+            unlocks,
         )
-        await interaction.followup.send(embed=embed, ephemeral=True)
+
+        saved_unlocks = await self.bot.get_emoji_unlocks(
+            interaction.guild.id,
+            force_refresh=True,
+        )
+        expected_unlocks = tuple(
+            (required_level, emoji, emoji)
+            for required_level, emoji in unlocks
+        )
+        if saved_unlocks != expected_unlocks:
+            log.error(
+                "Emoji bulk-save verification failed for guild %s: expected=%r saved=%r",
+                interaction.guild.id,
+                expected_unlocks,
+                saved_unlocks,
+            )
+            await interaction.followup.send(
+                "The emoji list could not be verified after saving. Check the "
+                "Railway logs and try again.",
+                ephemeral=True,
+            )
+            return
+
+        updated, unchanged, skipped = await self.bot.sync_guild_nicknames(
+            interaction.guild
+        )
+        await interaction.followup.send(
+            f"Saved and verified **{len(saved_unlocks)}** emoji unlock(s).\n"
+            f"Recalculated **{reset_count}** saved member(s) using Auto Upgrade.\n"
+            f"Nicknames updated: **{updated}**, already correct: **{unchanged}**, "
+            f"skipped: **{skipped}**.",
+            ephemeral=True,
+        )
 
 
 emoji_admin_group = app_commands.Group(
@@ -3891,14 +3971,29 @@ async def emoji_admin_remove(
 
 @emoji_admin_group.command(
     name="editall",
-    description="Paste the full emoji unlock list and replace every entry.",
+    description="Open one popup to copy, paste, and replace every emoji unlock.",
 )
 @app_commands.guild_only()
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.checks.has_permissions(manage_guild=True)
 async def emoji_admin_editall(interaction: discord.Interaction) -> None:
     assert interaction.guild is not None
-    await interaction.response.send_modal(EmojiAdminEditAllModal(bot, interaction.guild))
+    unlocks = await bot.get_emoji_unlocks(
+        interaction.guild.id,
+        force_refresh=True,
+    )
+    current_block = format_emoji_unlock_block(unlocks)
+    if len(current_block) > 4000:
+        await interaction.response.send_message(
+            "There are too many configured entries to fit in Discord's editor. "
+            "Remove a few entries first with `/emojiadmin remove`.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_modal(
+        EmojiBulkEditModal(bot, interaction.guild, current_block)
+    )
 
 
 @emoji_admin_group.command(
@@ -3909,7 +4004,10 @@ async def emoji_admin_editall(interaction: discord.Interaction) -> None:
 async def emoji_admin_list(interaction: discord.Interaction) -> None:
     """This is the only /emojiadmin subcommand available to every member."""
     assert interaction.guild is not None
-    unlocks = await bot.get_emoji_unlocks(interaction.guild.id)
+    unlocks = await bot.get_emoji_unlocks(
+        interaction.guild.id,
+        force_refresh=True,
+    )
     lines: list[str] = []
     for required_level, emoji, _nickname_badge in unlocks:
         lines.append(f"{emoji} — Level **{required_level}**")
@@ -3920,8 +4018,8 @@ async def emoji_admin_list(interaction: discord.Interaction) -> None:
     )
     embed.set_footer(
         text=(
-            "Everyone can use this list. Only members with Manage Server can "
-            "use set, replace, remove, or reset."
+            "Everyone can use this list. Managers can use /emojiadmin editall "
+            "to copy, paste, and replace the full schedule."
         )
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
