@@ -138,6 +138,20 @@ def parse_emoji_unlocks(raw: str) -> tuple[tuple[int, str], ...]:
     return tuple(sorted(unlocks, key=lambda item: (item[0], item[1])))
 
 
+def parse_bulk_emoji_unlocks(raw: str) -> tuple[tuple[int, str], ...]:
+    """Parse pasted emoji unlock text from a modal or slash command.
+
+    Accepts entries separated by new lines, commas, or semicolons, for example:
+        0=⚪
+        1=🟣
+        2=🔴
+        5=🟢
+    """
+    normalized = raw.replace("\r", "\n").replace(";", ",")
+    normalized = re.sub(r"\n+", ",", normalized)
+    return parse_emoji_unlocks(normalized)
+
+
 DEFAULT_PARSED_EMOJI_UNLOCKS = parse_emoji_unlocks(DEFAULT_EMOJI_UNLOCKS)
 
 if not DISCORD_TOKEN:
@@ -1940,6 +1954,49 @@ class KatBot(commands.Bot):
                 )
         self.invalidate_emoji_unlocks(guild_id)
 
+    async def replace_all_emoji_unlocks(
+        self,
+        guild_id: int,
+        raw_entries: str,
+    ) -> tuple[EmojiUnlock, ...]:
+        parsed = parse_bulk_emoji_unlocks(raw_entries)
+        display_emojis = [emoji for _level, emoji in parsed]
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                await connection.execute(
+                    "DELETE FROM emoji_unlocks WHERE guild_id = $1;",
+                    guild_id,
+                )
+                await connection.executemany(
+                    """
+                    INSERT INTO emoji_unlocks (
+                        guild_id,
+                        emoji,
+                        nickname_badge,
+                        required_level
+                    )
+                    VALUES ($1, $2, $3, $4);
+                    """,
+                    [
+                        (guild_id, emoji, emoji, required_level)
+                        for required_level, emoji in parsed
+                    ],
+                )
+                await connection.execute(
+                    """
+                    UPDATE voice_levels
+                    SET selected_emoji = ''
+                    WHERE guild_id = $1
+                      AND NOT (selected_emoji = ANY($2::TEXT[]))
+                      AND selected_emoji <> $3;
+                    """,
+                    guild_id,
+                    display_emojis,
+                    NO_EMOJI_SELECTION,
+                )
+        self.invalidate_emoji_unlocks(guild_id)
+        return tuple((level, emoji, emoji) for level, emoji in parsed)
+
     async def get_or_create_stats(
         self,
         guild_id: int,
@@ -3631,6 +3688,56 @@ async def emoji_remove(interaction: discord.Interaction) -> None:
 bot.tree.add_command(emoji_group)
 
 
+class EmojiAdminEditAllModal(discord.ui.Modal, title="Edit All Emoji Unlocks"):
+    entries = discord.ui.TextInput(
+        label="Paste the full emoji unlock list",
+        style=discord.TextStyle.paragraph,
+        placeholder="0=⚪\n1=🟣\n2=🔴\n5=🟢\n10=💎",
+        required=True,
+        max_length=2000,
+    )
+
+    def __init__(self, bot: "KatBot", guild: discord.Guild) -> None:
+        super().__init__(timeout=600)
+        self.bot = bot
+        self.guild = guild
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            parsed = await self.bot.replace_all_emoji_unlocks(
+                self.guild.id,
+                str(self.entries),
+            )
+        except (ValueError, RuntimeError) as exc:
+            await interaction.followup.send(
+                f"Could not replace the emoji list: {exc}",
+                ephemeral=True,
+            )
+            return
+
+        updated, unchanged, skipped = await self.bot.sync_guild_nicknames(self.guild)
+        preview = "\n".join(
+            f"{emoji} — Level **{required_level}**"
+            for required_level, emoji, _nickname_badge in parsed[:12]
+        )
+        if len(parsed) > 12:
+            preview += f"\n...and **{len(parsed) - 12}** more"
+
+        embed = discord.Embed(
+            title="Emoji Unlocks Updated",
+            description=preview or "No emoji unlocks configured.",
+            color=discord.Color.green(),
+        )
+        embed.set_footer(
+            text=(
+                f"Saved {len(parsed)} entries • Nicknames updated: {updated} • "
+                f"Already correct: {unchanged} • Skipped: {skipped}"
+            )
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
 emoji_admin_group = app_commands.Group(
     name="emojiadmin",
     description="View or manage this server's level-unlocked nickname emojis.",
@@ -3780,6 +3887,18 @@ async def emoji_admin_remove(
         f"skipped: **{skipped}**.",
         ephemeral=True,
     )
+
+
+@emoji_admin_group.command(
+    name="editall",
+    description="Paste the full emoji unlock list and replace every entry.",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def emoji_admin_editall(interaction: discord.Interaction) -> None:
+    assert interaction.guild is not None
+    await interaction.response.send_modal(EmojiAdminEditAllModal(bot, interaction.guild))
 
 
 @emoji_admin_group.command(
