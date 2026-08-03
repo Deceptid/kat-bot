@@ -1,3 +1,6 @@
+
+
+
 from __future__ import annotations
 
 import asyncio
@@ -206,6 +209,9 @@ CREATE TABLE IF NOT EXISTS voice_levels (
 ALTER TABLE voice_levels
 ADD COLUMN IF NOT EXISTS selected_emoji TEXT NOT NULL DEFAULT '';
 
+ALTER TABLE voice_levels
+ADD COLUMN IF NOT EXISTS level_locked BOOLEAN NOT NULL DEFAULT FALSE;
+
 CREATE INDEX IF NOT EXISTS voice_levels_guild_total_idx
 ON voice_levels (guild_id, total_voice_seconds DESC);
 
@@ -303,9 +309,13 @@ SELECT guild_id, user_id, $3, 0, -1, NOW()
 FROM incoming
 ON CONFLICT (guild_id, user_id)
 DO UPDATE SET
-    total_voice_seconds = voice_levels.total_voice_seconds + EXCLUDED.total_voice_seconds,
+    total_voice_seconds = CASE
+        WHEN voice_levels.level_locked THEN voice_levels.total_voice_seconds
+        ELSE voice_levels.total_voice_seconds + EXCLUDED.total_voice_seconds
+    END,
     last_active_at = NOW()
-RETURNING guild_id, user_id, total_voice_seconds, level, nickname_level, selected_emoji;
+RETURNING guild_id, user_id, total_voice_seconds, level, nickname_level,
+          selected_emoji, level_locked;
 """
 
 ENSURE_MEMBER_SQL = """
@@ -3293,6 +3303,193 @@ async def game_admin_error(
 
 bot.tree.add_command(game_admin_group)
 
+
+level_admin_group = app_commands.Group(
+    name="leveladmin",
+    description="Set and lock a member's voice level.",
+)
+
+
+@level_admin_group.command(
+    name="set",
+    description="Set a member to a fixed level that will not change from voice activity.",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.describe(
+    member="The member whose level should be fixed",
+    level="The exact level to assign and lock",
+)
+async def level_admin_set(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    level: app_commands.Range[int, 0, 100000],
+) -> None:
+    assert interaction.guild is not None
+    if member.bot:
+        await interaction.response.send_message(
+            "Bot accounts do not use the human voice-level system.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    fixed_level = int(level)
+    fixed_seconds = cumulative_seconds_for_level(fixed_level)
+
+    row = await bot.pool.fetchrow(
+        """
+        INSERT INTO voice_levels (
+            guild_id,
+            user_id,
+            total_voice_seconds,
+            level,
+            nickname_level,
+            level_locked,
+            last_active_at
+        )
+        VALUES ($1, $2, $3, $4, -1, TRUE, NOW())
+        ON CONFLICT (guild_id, user_id)
+        DO UPDATE SET
+            total_voice_seconds = EXCLUDED.total_voice_seconds,
+            level = EXCLUDED.level,
+            nickname_level = -1,
+            level_locked = TRUE,
+            last_active_at = NOW()
+        RETURNING selected_emoji;
+        """,
+        interaction.guild.id,
+        member.id,
+        fixed_seconds,
+        fixed_level,
+    )
+    selected_emoji = str(row["selected_emoji"] or "") if row else ""
+    nickname_result = await bot.apply_level_nickname(
+        member,
+        fixed_level,
+        selected_emoji,
+    )
+    if nickname_result in {"updated", "unchanged"}:
+        await bot.mark_nickname_synced(
+            interaction.guild.id,
+            member.id,
+            fixed_level,
+        )
+
+    message = (
+        f"🔒 {member.mention} is now fixed at **Level {fixed_level}** "
+        f"`{superscript_number(fixed_level)}`. Voice activity will not change it."
+    )
+    if nickname_result not in {"updated", "unchanged"}:
+        message += (
+            "\nThe level was saved, but Kat could not update the nickname because "
+            "of Discord nickname permissions or role hierarchy."
+        )
+    await interaction.followup.send(message, ephemeral=True)
+
+
+@level_admin_group.command(
+    name="unlock",
+    description="Unlock a fixed member level so normal voice XP continues again.",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.describe(member="The member whose level should resume normal XP")
+async def level_admin_unlock(
+    interaction: discord.Interaction,
+    member: discord.Member,
+) -> None:
+    assert interaction.guild is not None
+    await bot.get_or_create_stats(interaction.guild.id, member.id)
+    result = await bot.pool.execute(
+        """
+        UPDATE voice_levels
+        SET level_locked = FALSE,
+            nickname_level = -1
+        WHERE guild_id = $1 AND user_id = $2 AND level_locked = TRUE;
+        """,
+        interaction.guild.id,
+        member.id,
+    )
+    if result.endswith("0"):
+        await interaction.response.send_message(
+            f"{member.mention}'s level is already using normal voice XP.",
+            ephemeral=True,
+        )
+        return
+
+    row = await bot.get_or_create_stats(interaction.guild.id, member.id)
+    level = level_from_total_seconds(int(row["total_voice_seconds"]))
+    nickname_result = await bot.apply_level_nickname(
+        member,
+        level,
+        row["selected_emoji"],
+    )
+    if nickname_result in {"updated", "unchanged"}:
+        await bot.mark_nickname_synced(interaction.guild.id, member.id, level)
+
+    await interaction.response.send_message(
+        f"🔓 {member.mention}'s level is unlocked at **Level {level}**. "
+        "Normal voice XP will continue from here.",
+        ephemeral=True,
+    )
+
+
+@level_admin_group.command(
+    name="status",
+    description="Check whether a member's voice level is fixed or using normal XP.",
+)
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.describe(member="The member to check")
+async def level_admin_status(
+    interaction: discord.Interaction,
+    member: discord.Member,
+) -> None:
+    assert interaction.guild is not None
+    row = await bot.get_or_create_stats(interaction.guild.id, member.id)
+    level = level_from_total_seconds(int(row["total_voice_seconds"]))
+    locked = bool(row["level_locked"])
+    await interaction.response.send_message(
+        (
+            f"{member.mention} is **Level {level}** `{superscript_number(level)}`.\n"
+            + (
+                "🔒 The level is fixed and will not change."
+                if locked
+                else "🔓 The level is using normal voice XP."
+            )
+        ),
+        ephemeral=True,
+    )
+
+
+@level_admin_group.error
+async def level_admin_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+) -> None:
+    if isinstance(error, app_commands.MissingPermissions):
+        message = "You need the **Manage Server** permission to manage fixed levels."
+    else:
+        original = getattr(error, "original", error)
+        log.error(
+            "Level admin command failed: %r",
+            original,
+            exc_info=(type(original), original, original.__traceback__),
+        )
+        message = "The level-admin command failed. Check the Railway logs."
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
+
+
+bot.tree.add_command(level_admin_group)
+
+
 @bot.tree.command(name="rank", description="Show voice level and progress.")
 @app_commands.guild_only()
 @app_commands.describe(member="The member to view; leave blank for yourself")
@@ -3363,21 +3560,32 @@ async def rank(
         inline=False,
     )
 
-    embed.add_field(
-        name=f"Progress to Level {level + 1}",
-        value=(
-            f"`{progress_bar(progress, required)}`\n"
-            f"**{format_duration(progress)}** / {format_duration(required)}\n"
-            f"**{format_duration(remaining)} remaining**"
-        ),
-        inline=False,
-    )
-    embed.set_footer(
-        text=(
-            f"Voice counts every {TICK_SECONDS}s · "
-            f"Minimum humans in channel: {MIN_HUMANS_IN_VC}"
+    if bool(row["level_locked"]):
+        embed.add_field(
+            name="Level Status",
+            value=(
+                "🔒 **Fixed by an administrator**\n"
+                "Voice activity will not increase or decrease this level."
+            ),
+            inline=False,
         )
-    )
+        embed.set_footer(text="This member's voice level is locked.")
+    else:
+        embed.add_field(
+            name=f"Progress to Level {level + 1}",
+            value=(
+                f"`{progress_bar(progress, required)}`\n"
+                f"**{format_duration(progress)}** / {format_duration(required)}\n"
+                f"**{format_duration(remaining)} remaining**"
+            ),
+            inline=False,
+        )
+        embed.set_footer(
+            text=(
+                f"Voice counts every {TICK_SECONDS}s · "
+                f"Minimum humans in channel: {MIN_HUMANS_IN_VC}"
+            )
+        )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -3392,7 +3600,7 @@ async def leaderboard(interaction: discord.Interaction) -> None:
 
     rows = await bot.pool.fetch(
         """
-        SELECT user_id, total_voice_seconds
+        SELECT user_id, total_voice_seconds, level_locked
         FROM voice_levels
         WHERE guild_id = $1
         ORDER BY total_voice_seconds DESC, user_id ASC
@@ -3416,9 +3624,10 @@ async def leaderboard(interaction: discord.Interaction) -> None:
         total = int(row["total_voice_seconds"])
         level = level_from_total_seconds(total)
         prefix = medals[index - 1] if index <= 3 else f"**{index}.**"
+        lock_marker = " 🔒" if bool(row["level_locked"]) else ""
         lines.append(
-            f"{prefix} {name} — **Level {level}** `{superscript_number(level)}` "
-            f"· {format_duration(total)}"
+            f"{prefix} {name} — **Level {level}** `{superscript_number(level)}`"
+            f"{lock_marker} · {format_duration(total)}"
         )
 
     embed = discord.Embed(
