@@ -413,8 +413,8 @@ def validate_display_emoji(emoji: str) -> str:
         raise ValueError(f"The emoji cannot contain `{NICKNAME_PREFIX}`.")
     if is_custom_emoji_code(emoji) or emoji.startswith(("<:", "<a:")):
         raise ValueError(
-            "Discord Unicode emojis are disabled for this bot. "
-            "Use a normal Unicode emoji such as `⚪`, `💎`, or `👑`."
+            "Custom Discord server emoji codes cannot appear in nicknames. "
+            "Paste a normal Unicode emoji such as `🪲`, `💎`, or `👑`."
         )
     if len(emoji) > 8:
         raise ValueError("The emoji must be 8 characters or fewer.")
@@ -487,6 +487,13 @@ def valid_selected_emoji(
 
     required_level = emoji_required_level(unlocks, emoji)
     if required_level is None:
+        # Locked levels may use an admin-supplied Unicode emoji that is not part
+        # of the server's normal level-unlock schedule.
+        if ignore_level_requirement:
+            try:
+                return validate_display_emoji(emoji)
+            except ValueError:
+                return ""
         return ""
     if level < required_level and not ignore_level_requirement:
         return ""
@@ -522,6 +529,10 @@ def nickname_with_level(
         ignore_level_requirement=ignore_level_requirement,
     )
     nickname_badge = emoji_nickname_badge(unlocks, display_emoji)
+    if display_emoji and not nickname_badge and ignore_level_requirement:
+        # Custom Unicode emoji supplied through /leveladmin set are stored
+        # directly as the locked member's nickname badge.
+        nickname_badge = display_emoji
     prefix = f"{nickname_badge}{NICKNAME_PREFIX}"
     max_base_length = max(
         1,
@@ -3387,8 +3398,8 @@ async def level_admin_emoji_autocomplete(
     member="The member whose level should be fixed",
     level="The exact level to assign and lock",
     emoji=(
-        "Optional configured emoji. Leave blank to use the highest badge unlocked "
-        "at the assigned level"
+        "Optional Unicode emoji to paste or select. Leave blank to use the highest "
+        "badge unlocked at the assigned level"
     ),
 )
 @app_commands.autocomplete(emoji=level_admin_emoji_autocomplete)
@@ -3413,16 +3424,12 @@ async def level_admin_set(
 
     requested_emoji = (emoji or "").strip()
     if requested_emoji:
-        required_level = emoji_required_level(unlocks, requested_emoji)
-        if required_level is None:
-            await interaction.followup.send(
-                "That emoji is not configured for this server. Choose one from the "
-                "suggestions or check `/emojiadmin list`.",
-                ephemeral=True,
-            )
+        try:
+            selected_emoji = validate_display_emoji(requested_emoji)
+        except ValueError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
             return
-        selected_emoji = requested_emoji
-        badge_reason = "the emoji you selected"
+        badge_reason = "the Unicode emoji you pasted or selected"
     else:
         available = unlocked_emojis(fixed_level, unlocks)
         if available:
